@@ -7,7 +7,6 @@ This is an enterprise feature and requires a premium license.
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import chain
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, NamedTuple, Protocol, overload
 
 from fastapi import (
@@ -574,7 +573,7 @@ async def _classify_group_member(member: SCIMMember, prisma_client: PrismaClient
 
     for attribute in ("sso_user_id", "user_email"):
         fallback_user = await _table(UserRepository(prisma_client)).find_first(
-            where=MappingProxyType({attribute: value})
+            where={attribute: value},  # mutable-ok: Prisma serializer requires a concrete dict
         )
         if fallback_user is not None:
             verbose_proxy_logger.info(
