@@ -15,6 +15,7 @@ import pytest
 from litellm.proxy import proxy_server
 from litellm.proxy.common_utils.encrypt_decrypt_utils import (
     _V2_GCM_PREFIX,
+    decrypt_value_helper,
     encrypt_value_helper,
 )
 from litellm.proxy.management_endpoints import credential_migration as cm
@@ -514,3 +515,125 @@ async def test_migrate_covered_tables_reports_real_counts(salt_key, monkeypatch)
     assert by_loc["model_table"].migrated == 1  # was legacy pre, v2 post
     assert by_loc["model_table"].legacy == 0  # residual zero after rotation
     assert by_loc["model_table"].already_v2 == 1
+
+
+# --------------------------- salt-key rotation ---------------------------
+
+
+@pytest.fixture
+def rotated_salt_key(monkeypatch):
+    """Simulate a completed key swap: new key active, old one retired."""
+    monkeypatch.setattr(proxy_server, "general_settings", {})
+    monkeypatch.setenv("LITELLM_SALT_KEY", "sk-salt-old")
+    old_ct = encrypt_value_helper("provider-api-key")
+    monkeypatch.setenv("LITELLM_SALT_KEY", "sk-salt-new")
+    monkeypatch.setenv("LITELLM_SALT_KEY_PREVIOUS", "sk-salt-old")
+    return old_ct
+
+
+def test_salt_key_policy_classifies_retired_ciphertext_as_legacy(rotated_salt_key):
+    assert cm.classify_value(rotated_salt_key, policy=cm.SALT_KEY_POLICY) == "legacy"
+    # The algorithm pass has nothing to do here: the format is already correct.
+    assert cm.classify_value(rotated_salt_key, policy=cm.ALGORITHM_POLICY) == "legacy"
+
+
+def test_salt_key_policy_reencrypts_under_active_key(rotated_salt_key, monkeypatch):
+    out = cm.reencrypt_value(rotated_salt_key, policy=cm.SALT_KEY_POLICY)
+
+    assert out != rotated_salt_key
+    # Readable with the retired key removed from the environment: the whole point.
+    monkeypatch.delenv("LITELLM_SALT_KEY_PREVIOUS")
+    assert decrypt_value_helper(out, key="t") == "provider-api-key"
+    assert cm.classify_value(out, policy=cm.SALT_KEY_POLICY) == "migrated"
+
+
+def test_salt_key_policy_preserves_the_legacy_format(rotated_salt_key):
+    """A salt-only rotation must not silently switch algorithms."""
+    out = cm.reencrypt_value(rotated_salt_key, policy=cm.SALT_KEY_POLICY)
+    assert not out.startswith(_V2_GCM_PREFIX)
+
+
+def test_salt_key_policy_is_idempotent(rotated_salt_key):
+    once = cm.reencrypt_value(rotated_salt_key, policy=cm.SALT_KEY_POLICY)
+    assert cm.reencrypt_value(once, policy=cm.SALT_KEY_POLICY) == once
+
+
+def test_salt_key_policy_does_not_require_the_aes_gate(rotated_salt_key):
+    """The AES gate guards the algorithm pass only, never the salt-key pass."""
+    assert cm.reencrypt_value(rotated_salt_key, policy=cm.SALT_KEY_POLICY) != rotated_salt_key
+
+
+@pytest.mark.asyncio
+async def test_salt_key_migration_requires_previous_keys(monkeypatch):
+    """Without the retired key, old ciphertext reads as plaintext and is skipped,
+    so the pass would report a clean run while leaving values behind.
+    """
+    monkeypatch.setenv("LITELLM_SALT_KEY", "sk-salt-new")
+    monkeypatch.delenv("LITELLM_SALT_KEY_PREVIOUS", raising=False)
+
+    with pytest.raises(RuntimeError, match="LITELLM_SALT_KEY_PREVIOUS"):
+        await cm.migrate_encryption(
+            prisma_client=MagicMock(),
+            user_api_key_dict=MagicMock(),
+            policy=cm.SALT_KEY_POLICY,
+        )
+
+
+def test_policy_for_mode():
+    assert cm.policy_for_mode("algorithm") is cm.ALGORITHM_POLICY
+    assert cm.policy_for_mode("salt-key") is cm.SALT_KEY_POLICY
+
+
+@pytest.mark.asyncio
+async def test_salt_key_check_reports_residual(rotated_salt_key):
+    client = MagicMock()
+    _empty_covered_tables(client)
+    client.db.litellm_teamtable.find_many = AsyncMock(return_value=[])
+    client.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
+    client.db.litellm_ssoconfig.find_unique = AsyncMock(return_value=None)
+    client.db.litellm_config.find_unique = AsyncMock(return_value=None)
+    client.db.litellm_config.update = AsyncMock()
+    client.db.litellm_proxymodeltable.find_many = AsyncMock(
+        return_value=[SimpleNamespace(litellm_params={"api_key": rotated_salt_key})]
+    )
+
+    report = await cm.check_encryption(client, policy=cm.SALT_KEY_POLICY)
+
+    assert report.residual_legacy == 1
+    assert report.as_dict()["locations"]["model_table"]["legacy"] == 1
+    client.db.litellm_config.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_salt_key_pass_walks_callback_vars(monkeypatch):
+    """Locations with no master-key rotation path are covered by the salt pass too."""
+    from litellm.proxy.common_utils.callback_utils import (
+        decrypt_callback_vars,
+        encrypt_callback_vars,
+    )
+
+    monkeypatch.setattr(proxy_server, "general_settings", {})
+    monkeypatch.setenv("LITELLM_SALT_KEY", "sk-salt-old")
+    old_meta = encrypt_callback_vars(
+        {"logging": [{"callback_vars": {"gcs_path_service_account": "sa-secret"}}]}
+    )
+    monkeypatch.setenv("LITELLM_SALT_KEY", "sk-salt-new")
+    monkeypatch.setenv("LITELLM_SALT_KEY_PREVIOUS", "sk-salt-old")
+
+    row = SimpleNamespace(team_id="t1", metadata=old_meta)
+    client = MagicMock()
+    client.db.litellm_teamtable.find_many = AsyncMock(return_value=[row])
+    client.db.litellm_teamtable.update = AsyncMock()
+
+    report = await cm._migrate_callback_vars_table(
+        client, "team", dry_run=False, policy=cm.SALT_KEY_POLICY
+    )
+
+    assert report.migrated == 1
+    written = json.loads(
+        client.db.litellm_teamtable.update.call_args.kwargs["data"]["metadata"]
+    )
+    # Readable once the retired key is gone: the rewrite used the active key.
+    monkeypatch.delenv("LITELLM_SALT_KEY_PREVIOUS")
+    rotated = decrypt_callback_vars(written)
+    assert rotated["logging"][0]["callback_vars"]["gcs_path_service_account"] == "sa-secret"

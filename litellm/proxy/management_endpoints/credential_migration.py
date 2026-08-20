@@ -1,10 +1,18 @@
 """
-At-rest credential re-encryption migration.
+At-rest credential re-encryption.
 
-Switches every encrypted-at-rest value from the legacy XSalsa20-Poly1305 (nacl)
-format to the versioned AES-256-GCM (``v2:gcm:``) format produced by
-``encrypt_decrypt_utils`` when ``general_settings.encryption_algorithm`` is set to
-``aes-256-gcm``.
+Two passes share one set of walkers, selected by a :class:`ReencryptPolicy`:
+
+* **algorithm** (:data:`ALGORITHM_POLICY`) switches every encrypted-at-rest value
+  from the legacy XSalsa20-Poly1305 (nacl) format to the versioned AES-256-GCM
+  (``v2:gcm:``) format produced by ``encrypt_decrypt_utils`` when
+  ``general_settings.encryption_algorithm`` is set to ``aes-256-gcm``. The key is
+  unchanged.
+* **salt key** (:data:`SALT_KEY_POLICY`) re-encrypts every value that still
+  decrypts only under a retired salt key (``LITELLM_SALT_KEY_PREVIOUS``) under the
+  active ``LITELLM_SALT_KEY``, leaving the format alone. This is what makes a
+  leaked salt key recoverable without regenerating virtual keys: those are SHA-256
+  hashes, never salt-key ciphertext.
 
 Design properties (see case 2026-06-24 fix plan):
 
@@ -31,8 +39,10 @@ config rows, and the SSO config table.
 """
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Final, Literal, cast
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final, Literal, assert_never, cast
 
 from litellm._logging import verbose_proxy_logger
 
@@ -46,9 +56,50 @@ from litellm.proxy.common_utils.encrypt_decrypt_utils import (
     _get_salt_key,
     decrypt_value_helper,
     encrypt_value_helper,
+    get_previous_salt_keys,
+    try_decrypt_with_key,
 )
 
 ValueClass = Literal["migrated", "legacy", "plaintext", "undecryptable", "not-a-string"]
+
+
+@dataclass(frozen=True, slots=True)
+class ReencryptPolicy:
+    """What "already re-encrypted" means for one pass over the stored values.
+
+    ``is_current`` decides whether a decryptable value is left alone (counted as
+    ``already_v2``) or rewritten through ``encrypt_value_helper`` (counted as
+    ``migrated``). Everything a pass would still rewrite is residual ``legacy``.
+    """
+
+    name: Literal["algorithm", "salt_key"]
+    is_current: Callable[[str], bool]
+
+
+def _is_target_algorithm(value: str) -> bool:
+    return value.startswith(_V2_GCM_PREFIX)
+
+
+def _is_under_active_salt_key(value: str) -> bool:
+    primary: Final = _get_salt_key()
+    return primary is not None and try_decrypt_with_key(value=value, signing_key=primary) is not None
+
+
+ALGORITHM_POLICY: Final = ReencryptPolicy(name="algorithm", is_current=_is_target_algorithm)
+SALT_KEY_POLICY: Final = ReencryptPolicy(name="salt_key", is_current=_is_under_active_salt_key)
+
+ReencryptMode = Literal["algorithm", "salt-key"]
+
+
+def policy_for_mode(mode: ReencryptMode) -> ReencryptPolicy:
+    """Map the wire-level ``mode`` of the migration endpoints onto its policy."""
+    match mode:
+        case "algorithm":
+            return ALGORITHM_POLICY
+        case "salt-key":
+            return SALT_KEY_POLICY
+        case _:
+            assert_never(mode)
 
 
 @dataclass
@@ -57,13 +108,13 @@ class LocationReport:
 
     location: str
     scanned: int = 0
-    migrated: int = 0  # values rewritten to v2 this run
-    already_v2: int = 0  # values already migrated (skipped)
+    migrated: int = 0  # values rewritten this run
+    already_v2: int = 0  # values already in the target shape (skipped)
     plaintext: int = 0  # legacy-plaintext values (no ciphertext to migrate)
     undecryptable: int = 0  # could not decrypt — preserved, not overwritten
 
     # Used by --check (read-only classification):
-    legacy: int = 0  # nacl ciphertext still awaiting migration
+    legacy: int = 0  # ciphertext still awaiting re-encryption
 
     def as_dict(self) -> dict[str, int]:
         return {
@@ -112,14 +163,16 @@ def is_migrated(value: object) -> bool:
     return isinstance(value, str) and value.startswith(_V2_GCM_PREFIX)
 
 
-def classify_value(value: object, key: str = "scan") -> ValueClass:
+def classify_value(value: object, key: str = "scan", policy: ReencryptPolicy = ALGORITHM_POLICY) -> ValueClass:
     """Classify a stored value for the residual scanner.
 
     * ``not-a-string`` — not a string (numbers/bools/None left as-is on disk).
-    * ``migrated`` — carries the ``v2:gcm:`` prefix.
-    * ``legacy`` — decrypts under the legacy nacl reader (still needs migrating).
-    * ``plaintext`` — a non-empty string that does not decrypt and is not v2;
-      treated as legacy plaintext (nothing to migrate).
+    * ``migrated`` — already in the shape ``policy`` targets (``v2:gcm:`` format,
+      or readable under the active salt key).
+    * ``legacy`` — decrypts (under any configured salt key) but not in the target
+      shape, so this pass would rewrite it.
+    * ``plaintext`` — a non-empty string that does not decrypt at all; treated as
+      legacy plaintext (nothing to migrate).
     * ``undecryptable`` — reserved for callers that already know a value is
       ciphertext but cannot decrypt it; ``classify_value`` itself cannot tell a
       corrupt ciphertext from plaintext, so it returns ``plaintext`` for both.
@@ -128,26 +181,27 @@ def classify_value(value: object, key: str = "scan") -> ValueClass:
         return "not-a-string"
     if value == "":
         return "plaintext"
-    if value.startswith(_V2_GCM_PREFIX):
+    if policy.is_current(value):
         return "migrated"
     decrypted: Final = decrypt_value_helper(value=value, key=key, exception_type="debug", return_original_value=False)
     if decrypted is None:
-        # Did not decrypt under nacl and has no v2 marker: legacy plaintext.
+        # Did not decrypt under any configured salt key: legacy plaintext.
         return "plaintext"
     return "legacy"
 
 
-def reencrypt_value(value: object, key: str = "migrate") -> object:
-    """Re-encrypt a single stored string into the configured (AES) format.
+def reencrypt_value(value: object, key: str = "migrate", policy: ReencryptPolicy = ALGORITHM_POLICY) -> object:
+    """Re-encrypt a single stored string into the shape ``policy`` targets.
 
-    Returns the value unchanged if it is not a string, is already ``v2:``, or
-    cannot be decrypted (skip-on-undecryptable). Otherwise decrypts under the
-    format-detecting reader and re-encrypts through ``encrypt_value_helper``
-    (which writes AES when the gate is on).
+    Returns the value unchanged if it is not a string, already matches the
+    policy, or cannot be decrypted (skip-on-undecryptable). Otherwise decrypts
+    under the format- and key-detecting reader and re-encrypts through
+    ``encrypt_value_helper`` (which writes AES when the gate is on, always under
+    the active salt key).
     """
     if not isinstance(value, str) or value == "":
         return value
-    if value.startswith(_V2_GCM_PREFIX):
+    if policy.is_current(value):
         return value  # idempotent: already migrated
     decrypted: Final = decrypt_value_helper(value=value, key=key, exception_type="debug", return_original_value=False)
     if decrypted is None:
@@ -157,7 +211,11 @@ def reencrypt_value(value: object, key: str = "migrate") -> object:
     return encrypt_value_helper(decrypted)
 
 
-def reencrypt_selective_dict(data: dict[str, object], sensitive_keys: list[str]) -> dict[str, object]:
+def reencrypt_selective_dict(
+    data: dict[str, object],
+    sensitive_keys: list[str],
+    policy: ReencryptPolicy = ALGORITHM_POLICY,
+) -> dict[str, object]:
     """Return a copy of ``data`` with only ``sensitive_keys`` re-encrypted.
 
     Non-sensitive fields (e.g. ``base_url``, ``connection_id``) are left as-is.
@@ -168,7 +226,7 @@ def reencrypt_selective_dict(data: dict[str, object], sensitive_keys: list[str])
         v = out.get(k)
         if v is None:
             continue
-        out[k] = reencrypt_value(v, key=k)
+        out[k] = reencrypt_value(v, key=k, policy=policy)
     return out
 
 
@@ -201,6 +259,7 @@ async def _migrate_config_settings_row(
     param_name: str,
     sensitive_fields: list[str],
     dry_run: bool,
+    policy: ReencryptPolicy = ALGORITHM_POLICY,
 ) -> LocationReport:
     """Migrate a single ``LiteLLM_Config`` row whose ``param_value`` is a JSON
     dict with selected sensitive fields (vantage_settings / cloudzero_settings).
@@ -222,7 +281,7 @@ async def _migrate_config_settings_row(
         if v is None:
             continue
         report.scanned += 1
-        cls = classify_value(v, key=fld)
+        cls = classify_value(v, key=fld, policy=policy)
         if cls == "migrated":
             report.already_v2 += 1
             continue
@@ -232,7 +291,7 @@ async def _migrate_config_settings_row(
                 # stays legacy for the attestation (never counted as migrated).
                 report.legacy += 1
                 continue
-            new_v = reencrypt_value(v, key=fld)
+            new_v = reencrypt_value(v, key=fld, policy=policy)
             if new_v != v:
                 settings[fld] = new_v
                 report.migrated += 1
@@ -252,7 +311,11 @@ async def _migrate_config_settings_row(
     return report
 
 
-async def _migrate_sso_config(prisma_client: object, dry_run: bool) -> LocationReport:
+async def _migrate_sso_config(
+    prisma_client: object,
+    dry_run: bool,
+    policy: ReencryptPolicy = ALGORITHM_POLICY,
+) -> LocationReport:
     """Migrate the ``LiteLLM_SSOConfig`` row. All non-null fields are encrypted
     (via the same ``_encrypt_env_variables`` path used on save), so we re-encrypt
     every present string field.
@@ -274,7 +337,7 @@ async def _migrate_sso_config(prisma_client: object, dry_run: bool) -> LocationR
         if not isinstance(v, str) or v == "":
             continue
         report.scanned += 1
-        cls = classify_value(v, key=fld)
+        cls = classify_value(v, key=fld, policy=policy)
         if cls == "migrated":
             report.already_v2 += 1
             continue
@@ -284,7 +347,7 @@ async def _migrate_sso_config(prisma_client: object, dry_run: bool) -> LocationR
                 # stays legacy for the attestation (never counted as migrated).
                 report.legacy += 1
                 continue
-            new_v = reencrypt_value(v, key=fld)
+            new_v = reencrypt_value(v, key=fld, policy=policy)
             if new_v != v:
                 new_settings[fld] = new_v
                 report.migrated += 1
@@ -308,6 +371,7 @@ async def _migrate_callback_vars_table(
     prisma_client: object,
     table_name: Literal["team", "verification_token"],
     dry_run: bool,
+    policy: ReencryptPolicy = ALGORITHM_POLICY,
 ) -> LocationReport:
     """Migrate callback-var credentials on the team or verification-token table.
 
@@ -347,7 +411,7 @@ async def _migrate_callback_vars_table(
         for cvs in _iter_callback_var_dicts(metadata):
             for v in cvs.values():
                 report.scanned += 1
-                cls = _classify_callback_value(v)
+                cls = _classify_callback_value(v, policy=policy)
                 if cls == "migrated":
                     report.already_v2 += 1
                 elif cls == "legacy":
@@ -406,7 +470,7 @@ def _iter_callback_var_dicts(metadata: dict[str, object]):
             yield cvs
 
 
-def _classify_callback_value(value: object) -> ValueClass:
+def _classify_callback_value(value: object, policy: ReencryptPolicy = ALGORITHM_POLICY) -> ValueClass:
     """Classify one stored callback-var value, independent of the AES gate.
 
     Encrypted callback vars carry the ``litellm_enc::`` marker in front of the
@@ -424,7 +488,7 @@ def _classify_callback_value(value: object) -> ValueClass:
         return "not-a-string"
     inner = value
     inner = inner.removeprefix(_CALLBACK_VAR_ENCRYPTED_PREFIX)
-    return classify_value(inner, key="callback")
+    return classify_value(inner, key="callback", policy=policy)
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +529,7 @@ def _iter_encrypted_strings(obj: object):
             stack.extend(cur)
 
 
-def _classify_into_report(report: LocationReport, value: str) -> None:
+def _classify_into_report(report: LocationReport, value: str, policy: ReencryptPolicy = ALGORITHM_POLICY) -> None:
     """Classify one stored string and bump the matching read-only counter.
 
     Only genuine nacl ciphertext lands in ``legacy``; non-secret strings (model
@@ -473,7 +537,7 @@ def _classify_into_report(report: LocationReport, value: str) -> None:
     over-scanning a column is harmless to the residual count.
     """
     report.scanned += 1
-    cls: Final = classify_value(value, key="scan")
+    cls: Final = classify_value(value, key="scan", policy=policy)
     if cls == "migrated":
         report.already_v2 += 1
     elif cls == "legacy":
@@ -488,6 +552,7 @@ async def _scan_one_table(
     db_attr: str,
     json_columns: tuple,
     scalar_columns: tuple,
+    policy: ReencryptPolicy = ALGORITHM_POLICY,
 ) -> LocationReport:
     report: Final = LocationReport(location=location)
     table: Final = getattr(prisma_client.db, db_attr, None)
@@ -509,15 +574,15 @@ async def _scan_one_table(
                 except (ValueError, TypeError):
                     pass
             for s in _iter_encrypted_strings(raw):
-                _classify_into_report(report, s)
+                _classify_into_report(report, s, policy=policy)
         for col in scalar_columns:
             v = getattr(row, col, None)
             if isinstance(v, str):
-                _classify_into_report(report, v)
+                _classify_into_report(report, v, policy=policy)
     return report
 
 
-async def _scan_config_env_vars(prisma_client: object) -> LocationReport:
+async def _scan_config_env_vars(prisma_client: object, policy: ReencryptPolicy = ALGORITHM_POLICY) -> LocationReport:
     """Scan the ``environment_variables`` config row (``param_value`` dict)."""
     report: Final = LocationReport(location="config_environment_variables")
     try:
@@ -534,16 +599,19 @@ async def _scan_config_env_vars(prisma_client: object) -> LocationReport:
         except (ValueError, TypeError):
             value = {}
     for s in _iter_encrypted_strings(value):
-        _classify_into_report(report, s)
+        _classify_into_report(report, s, policy=policy)
     return report
 
 
-async def _scan_covered_tables(prisma_client: object) -> list[LocationReport]:
+async def _scan_covered_tables(
+    prisma_client: object,
+    policy: ReencryptPolicy = ALGORITHM_POLICY,
+) -> list[LocationReport]:
     """Read-only classification of every rotation-covered table. No writes."""
     reports: Final[list[LocationReport]] = []
     for location, db_attr, json_cols, scalar_cols in _COVERED_TABLE_SPECS:
-        reports.append(await _scan_one_table(prisma_client, location, db_attr, json_cols, scalar_cols))
-    reports.append(await _scan_config_env_vars(prisma_client))
+        reports.append(await _scan_one_table(prisma_client, location, db_attr, json_cols, scalar_cols, policy=policy))
+    reports.append(await _scan_config_env_vars(prisma_client, policy=policy))
     return reports
 
 
@@ -556,7 +624,11 @@ _VANTAGE_SENSITIVE: Final = ["api_key", "integration_token"]
 _CLOUDZERO_SENSITIVE: Final = ["api_key"]
 
 
-async def _migrate_covered_tables(prisma_client: object, user_api_key_dict: object) -> list[LocationReport]:
+async def _migrate_covered_tables(
+    prisma_client: object,
+    user_api_key_dict: object,
+    policy: ReencryptPolicy = ALGORITHM_POLICY,
+) -> list[LocationReport]:
     """Re-encrypt the tables already covered by ``_rotate_master_key`` (model
     table, credentials, MCP credential/env tables, config environment_variables)
     by running that orchestrator in *same-key* mode. With the AES gate on, the
@@ -571,7 +643,7 @@ async def _migrate_covered_tables(prisma_client: object, user_api_key_dict: obje
         _rotate_master_key,
     )
 
-    pre: Final = {r.location: r for r in await _scan_covered_tables(prisma_client)}
+    pre: Final = MappingProxyType({r.location: r for r in await _scan_covered_tables(prisma_client, policy=policy)})
 
     current_key: Final = _get_salt_key()
     if current_key is None:
@@ -582,10 +654,10 @@ async def _migrate_covered_tables(prisma_client: object, user_api_key_dict: obje
         prisma_client=cast("PrismaClient", prisma_client),
         user_api_key_dict=cast("UserAPIKeyAuth", user_api_key_dict),
         current_master_key=current_key,
-        new_master_key=current_key,  # same key, algorithm-only switch
+        new_master_key=current_key,  # writes land under the active salt key
     )
 
-    post: Final = await _scan_covered_tables(prisma_client)
+    post: Final = await _scan_covered_tables(prisma_client, policy=policy)
     for post_report in post:
         pre_report = pre.get(post_report.location)
         pre_legacy = pre_report.legacy if pre_report else 0
@@ -599,18 +671,23 @@ async def migrate_encryption(
     prisma_client: object,
     user_api_key_dict: object,
     dry_run: bool = False,
+    policy: ReencryptPolicy = ALGORITHM_POLICY,
 ) -> MigrationReport:
-    """Run the full at-rest re-encryption migration.
+    """Run the full at-rest re-encryption pass for ``policy``.
 
-    Requires ``general_settings.encryption_algorithm == 'aes-256-gcm'`` so writes
-    are produced in the AES format. Idempotent and resumable: re-running skips
+    Under :data:`ALGORITHM_POLICY` this requires
+    ``general_settings.encryption_algorithm == 'aes-256-gcm'`` so writes are
+    produced in the AES format. Idempotent and resumable: re-running skips
     already-migrated values and finishes any partial run.
 
     A ``dry_run`` performs no writes: the covered tables are scanned read-only
     (so their residual legacy still counts toward the attestation) and the
     net-new walkers run in dry-run mode.
     """
-    _assert_aes_gate_enabled()
+    if policy is ALGORITHM_POLICY:
+        _assert_aes_gate_enabled()
+    else:
+        _assert_previous_salt_keys_configured()
 
     report: Final = MigrationReport()
 
@@ -618,23 +695,31 @@ async def migrate_encryption(
     # delegate to the rotation path (with bracketing scans for counts); on a dry
     # run only classify them read-only.
     if dry_run:
-        for covered in await _scan_covered_tables(prisma_client):
+        for covered in await _scan_covered_tables(prisma_client, policy=policy):
             report.add(covered)
     else:
-        for covered in await _migrate_covered_tables(prisma_client, user_api_key_dict):
+        for covered in await _migrate_covered_tables(prisma_client, user_api_key_dict, policy=policy):
             report.add(covered)
 
     # Net-new walkers (items 3, 4, 11, 12, 13).
-    report.add(await _migrate_callback_vars_table(prisma_client, "team", dry_run))
-    report.add(await _migrate_callback_vars_table(prisma_client, "verification_token", dry_run))
-    report.add(await _migrate_config_settings_row(prisma_client, "vantage_settings", _VANTAGE_SENSITIVE, dry_run))
-    report.add(await _migrate_config_settings_row(prisma_client, "cloudzero_settings", _CLOUDZERO_SENSITIVE, dry_run))
-    report.add(await _migrate_sso_config(prisma_client, dry_run))
+    report.add(await _migrate_callback_vars_table(prisma_client, "team", dry_run, policy=policy))
+    report.add(await _migrate_callback_vars_table(prisma_client, "verification_token", dry_run, policy=policy))
+    report.add(
+        await _migrate_config_settings_row(
+            prisma_client, "vantage_settings", _VANTAGE_SENSITIVE, dry_run, policy=policy
+        )
+    )
+    report.add(
+        await _migrate_config_settings_row(
+            prisma_client, "cloudzero_settings", _CLOUDZERO_SENSITIVE, dry_run, policy=policy
+        )
+    )
+    report.add(await _migrate_sso_config(prisma_client, dry_run, policy=policy))
 
     return report
 
 
-async def check_encryption(prisma_client: object) -> MigrationReport:
+async def check_encryption(prisma_client: object, policy: ReencryptPolicy = ALGORITHM_POLICY) -> MigrationReport:
     """Read-only residual scan across **every** at-rest location. No writes.
 
     Covers both the rotation-managed tables (model / credentials / MCP credential
@@ -646,15 +731,36 @@ async def check_encryption(prisma_client: object) -> MigrationReport:
     report: Final = MigrationReport()
 
     # Rotation-covered tables (read-only classification).
-    for covered in await _scan_covered_tables(prisma_client):
+    for covered in await _scan_covered_tables(prisma_client, policy=policy):
         report.add(covered)
 
     # Net-new walker locations, in dry-run (read-only) mode.
-    report.add(await _migrate_callback_vars_table(prisma_client, "team", dry_run=True))
-    report.add(await _migrate_callback_vars_table(prisma_client, "verification_token", dry_run=True))
-    report.add(await _migrate_config_settings_row(prisma_client, "vantage_settings", _VANTAGE_SENSITIVE, dry_run=True))
+    report.add(await _migrate_callback_vars_table(prisma_client, "team", dry_run=True, policy=policy))
+    report.add(await _migrate_callback_vars_table(prisma_client, "verification_token", dry_run=True, policy=policy))
     report.add(
-        await _migrate_config_settings_row(prisma_client, "cloudzero_settings", _CLOUDZERO_SENSITIVE, dry_run=True)
+        await _migrate_config_settings_row(
+            prisma_client, "vantage_settings", _VANTAGE_SENSITIVE, dry_run=True, policy=policy
+        )
     )
-    report.add(await _migrate_sso_config(prisma_client, dry_run=True))
+    report.add(
+        await _migrate_config_settings_row(
+            prisma_client, "cloudzero_settings", _CLOUDZERO_SENSITIVE, dry_run=True, policy=policy
+        )
+    )
+    report.add(await _migrate_sso_config(prisma_client, dry_run=True, policy=policy))
     return report
+
+
+def _assert_previous_salt_keys_configured() -> None:
+    """Fail fast when no retired salt key is configured.
+
+    Without ``LITELLM_SALT_KEY_PREVIOUS``, values written under the retired key
+    cannot be read at all, so a rotation pass would classify them as plaintext
+    and leave them behind while reporting a clean run.
+    """
+    if not get_previous_salt_keys():
+        raise RuntimeError(
+            "Salt key rotation requires LITELLM_SALT_KEY_PREVIOUS to list the retired "
+            "salt key(s), with LITELLM_SALT_KEY set to the new one. Restart the proxy "
+            "with both set, then re-run the rotation."
+        )
