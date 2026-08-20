@@ -83,7 +83,7 @@ class JWKSUnreachableError(Exception):
 
 JWKS_FETCH_ATTEMPTS: Final = 3
 JWKS_FETCH_RETRY_BACKOFF_SECONDS: Final = 0.25
-JWKS_STALE_CACHE_TTL_SECONDS: Final = 86400
+JWKS_STALE_GRACE_SECONDS: Final = 86400
 STALE_CACHE_KEY_PREFIX: Final = "litellm_stale_"
 
 # Per-cache-key locks so a TTL lapse triggers one refresh instead of one per in-flight request.
@@ -712,7 +712,7 @@ class JWTHandler:
             await self.user_api_key_cache.async_set_cache(
                 key=stale_cache_key,
                 value=refreshed,
-                ttl=JWKS_STALE_CACHE_TTL_SECONDS,
+                ttl=ttl + JWKS_STALE_GRACE_SECONDS,
             )
             return refreshed
 

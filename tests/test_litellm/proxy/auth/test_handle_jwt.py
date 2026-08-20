@@ -18,7 +18,11 @@ from litellm.proxy._types import (
     ProxyErrorTypes,
     ProxyException,
 )
-from litellm.proxy.auth.handle_jwt import JWTAuthManager, JWTHandler
+from litellm.proxy.auth.handle_jwt import (
+    STALE_CACHE_KEY_PREFIX,
+    JWTAuthManager,
+    JWTHandler,
+)
 
 
 @pytest.mark.asyncio
@@ -4021,6 +4025,26 @@ async def test_get_public_key_serves_stale_keys_when_jwks_refresh_fails():
     public_key = await jwt_handler._get_public_key_from_jwks_url(jwks_url=jwks_url, kid="stale-key")
 
     assert public_key == jwk
+
+
+@pytest.mark.asyncio
+async def test_stale_jwks_copy_outlives_a_long_configured_public_key_ttl():
+    """The stale copy must outlive the active entry, whatever `public_key_ttl` is configured to."""
+    from litellm.caching.dual_cache import DualCache
+
+    jwks_url = "https://long-ttl-issuer.example.com/keys"
+    _, jwk = _get_rsa_key_and_jwk(kid="long-ttl-key")
+    cache = DualCache()
+    endpoint = _ScriptedJWKSEndpoint(({"keys": [jwk]},))
+    jwt_handler = _get_jwt_handler_with_scripted_endpoint(cache, endpoint, public_key_ttl=90000)
+
+    await jwt_handler._get_public_key_from_jwks_url(jwks_url=jwks_url, kid="long-ttl-key")
+
+    active_key = f"litellm_jwt_auth_keys_{jwks_url}"
+    active_ttl = cache.in_memory_cache.ttl_dict[active_key]
+    stale_ttl = cache.in_memory_cache.ttl_dict[f"{STALE_CACHE_KEY_PREFIX}{active_key}"]
+
+    assert stale_ttl > active_ttl
 
 
 @pytest.mark.asyncio
