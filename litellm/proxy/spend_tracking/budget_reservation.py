@@ -1263,17 +1263,7 @@ _INPUT_SIZE_FIELDS: Final = ("messages", "prompt", "input", "query", "documents"
 
 def _approximate_input_size(request_body: dict) -> int:
     """Length of the request's input text, a cheap stand-in for tokenizing cost"""
-    return sum(_text_size(request_body.get(field)) for field in _INPUT_SIZE_FIELDS)
-
-
-def _text_size(value: object) -> int:
-    if isinstance(value, str):
-        return len(value)
-    if isinstance(value, Mapping):
-        return sum(_text_size(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
-        return sum(_text_size(item) for item in value)
-    return 0
+    return sum(len(str(request_body.get(field, ""))) for field in _INPUT_SIZE_FIELDS)
 
 
 def _count_input_tokens(request_body: dict, model: str) -> int | None:
