@@ -48,6 +48,36 @@ describe("buildProjectApiParams", () => {
     expect(result.model_tpm_limit).toEqual({ "gpt-4": 200 });
   });
 
+  it("should build model_itpm_limit from modelLimits entries", () => {
+    const result = buildProjectApiParams({
+      ...baseValues,
+      modelLimits: [{ model: "gpt-4", itpm: 150 }],
+    });
+    expect(result.model_itpm_limit).toEqual({ "gpt-4": 150 });
+  });
+
+  it("should build model_otpm_limit from modelLimits entries", () => {
+    const result = buildProjectApiParams({
+      ...baseValues,
+      modelLimits: [{ model: "gpt-4", otpm: 250 }],
+    });
+    expect(result.model_otpm_limit).toEqual({ "gpt-4": 250 });
+  });
+
+  it("should map input and output-only model limits independently", () => {
+    const result = buildProjectApiParams({
+      ...baseValues,
+      modelLimits: [
+        { model: "input-model", itpm: 150 },
+        { model: "output-model", otpm: 250 },
+      ],
+    });
+    expect(result.model_itpm_limit).toEqual({ "input-model": 150 });
+    expect(result.model_otpm_limit).toEqual({ "output-model": 250 });
+    expect(result).not.toHaveProperty("model_tpm_limit");
+    expect(result).not.toHaveProperty("model_rpm_limit");
+  });
+
   it("should omit model_rpm_limit when no modelLimits are provided", () => {
     const result = buildProjectApiParams(baseValues);
     expect(result).not.toHaveProperty("model_rpm_limit");
@@ -56,6 +86,12 @@ describe("buildProjectApiParams", () => {
   it("should omit model_tpm_limit when no modelLimits are provided", () => {
     const result = buildProjectApiParams(baseValues);
     expect(result).not.toHaveProperty("model_tpm_limit");
+  });
+
+  it("should omit input and output TPM limits when no modelLimits are provided", () => {
+    const result = buildProjectApiParams(baseValues);
+    expect(result).not.toHaveProperty("model_itpm_limit");
+    expect(result).not.toHaveProperty("model_otpm_limit");
   });
 
   it("should skip a modelLimits entry that has no model name", () => {

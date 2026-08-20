@@ -52,6 +52,8 @@ const project: ProjectResponse = {
     guardrails: ["pii-guard"],
     model_rpm_limit: { "gpt-4": 20 },
     model_tpm_limit: { "gpt-4": 100 },
+    model_itpm_limit: { "gpt-4": 60 },
+    model_otpm_limit: { "gpt-4": 40 },
   },
   models: ["gpt-4"],
   spend: 10,
@@ -120,6 +122,8 @@ describe("EditProjectModal submit payload", () => {
       guardrails: ["pii-guard"],
       model_rpm_limit: { "gpt-4": 20 },
       model_tpm_limit: { "gpt-4": 100 },
+      model_itpm_limit: { "gpt-4": 60 },
+      model_otpm_limit: { "gpt-4": 40 },
       metadata: { owner: "platform" },
       team_id: "team-1",
     });
@@ -200,6 +204,29 @@ describe("EditProjectModal submit payload", () => {
     expect(variables().params).not.toHaveProperty("guardrails");
     expect(variables().params).not.toHaveProperty("model_rpm_limit");
     expect(variables().params).not.toHaveProperty("model_tpm_limit");
+    expect(variables().params).not.toHaveProperty("model_itpm_limit");
+    expect(variables().params).not.toHaveProperty("model_otpm_limit");
+    expect(variables().params).not.toHaveProperty("metadata");
+  });
+
+  it("round-trips input and output-only model limits from project metadata", async () => {
+    const user = setup();
+    renderModal({
+      ...project,
+      metadata: {
+        model_itpm_limit: { "input-model": 150 },
+        model_otpm_limit: { "output-model": 250 },
+      },
+    } as unknown as ProjectResponse);
+    await screen.findByDisplayValue("My Project");
+
+    await user.click(screen.getByText("Advanced Settings"));
+    await screen.findByText("Model-Specific Limits");
+    await save(user);
+
+    await waitFor(() => expect(mutate).toHaveBeenCalled());
+    expect(variables().params.model_itpm_limit).toStrictEqual({ "input-model": 150 });
+    expect(variables().params.model_otpm_limit).toStrictEqual({ "output-model": 250 });
     expect(variables().params).not.toHaveProperty("metadata");
   });
 });

@@ -21,18 +21,35 @@ interface EditProjectModalProps {
   onSuccess?: () => void;
 }
 
-const INTERNAL_METADATA_KEYS = new Set(["model_rpm_limit", "model_tpm_limit", "guardrails"]);
+const INTERNAL_METADATA_KEYS = new Set([
+  "model_rpm_limit",
+  "model_tpm_limit",
+  "model_itpm_limit",
+  "model_otpm_limit",
+  "guardrails",
+]);
 
-const toFormValues = (project: ProjectResponse): ProjectFormValues => {
+export const toFormValues = (project: ProjectResponse): ProjectFormValues => {
   const metadataObj = (project.metadata ?? {}) as Record<string, unknown>;
   const rpmLimits = (metadataObj.model_rpm_limit ?? {}) as Record<string, number>;
   const tpmLimits = (metadataObj.model_tpm_limit ?? {}) as Record<string, number>;
+  const itpmLimits = (metadataObj.model_itpm_limit ?? {}) as Record<string, number>;
+  const otpmLimits = (metadataObj.model_otpm_limit ?? {}) as Record<string, number>;
   const guardrails = (Array.isArray(metadataObj.guardrails) ? metadataObj.guardrails : []) as string[];
 
-  const modelLimits = Array.from(new Set([...Object.keys(rpmLimits), ...Object.keys(tpmLimits)])).map((model) => ({
+  const modelLimits = Array.from(
+    new Set([
+      ...Object.keys(rpmLimits),
+      ...Object.keys(tpmLimits),
+      ...Object.keys(itpmLimits),
+      ...Object.keys(otpmLimits),
+    ]),
+  ).map((model) => ({
     model,
     rpm: rpmLimits[model],
     tpm: tpmLimits[model],
+    itpm: itpmLimits[model],
+    otpm: otpmLimits[model],
   }));
 
   const metadata = Object.entries(metadataObj)
