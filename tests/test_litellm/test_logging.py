@@ -20,6 +20,7 @@ from litellm._logging import (
     CorrelationContextFilter,
     CorrelationPlainFormatter,
     JsonFormatter,
+    SecretRedactionFilter,
     StdoutLogTruncationFilter,
     _initialize_loggers_with_handler,
     _turn_on_json,
@@ -732,6 +733,24 @@ def test_oversized_traceback_is_truncated(monkeypatch):
     assert LITELLM_TRUNCATED_PAYLOAD_FIELD in record.exc_text
     assert len(record.exc_text) < 1000
     assert "Traceback (most recent call last)" in record.exc_text
+
+
+def test_secret_filter_keeps_truncated_traceback(monkeypatch):
+    """SecretRedactionFilter runs after truncation, so it must redact the capped
+    traceback instead of reformatting the full one from exc_info."""
+    monkeypatch.setenv("MAX_STRING_LENGTH_STDOUT_LOG", "500")
+    try:
+        raise ValueError("sk-1234567890abcdefghij payload " + "p" * 100_000)
+    except ValueError:
+        exc_info = sys.exc_info()
+    record = _make_record(logging.ERROR, "Exception occured", exc_info=exc_info)
+
+    assert StdoutLogTruncationFilter().filter(record) is True
+    assert SecretRedactionFilter().filter(record) is True
+
+    assert record.exc_text is not None
+    assert len(record.exc_text) < 1000
+    assert "sk-1234567890abcdefghij" not in record.exc_text
 
 
 def test_truncation_filter_survives_json_reconfiguration():

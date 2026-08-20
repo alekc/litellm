@@ -107,7 +107,7 @@ class SecretRedactionFilter(logging.Filter):
         # Redact exception tracebacks
         if record.exc_info and record.exc_info[1] is not None:
             try:
-                record.exc_text = _redact_string(self._formatter.formatException(record.exc_info))
+                record.exc_text = _redact_string(record.exc_text or self._formatter.formatException(record.exc_info))
             except Exception:
                 pass
 
