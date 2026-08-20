@@ -1697,3 +1697,112 @@ def test_a_deployment_the_rollup_will_not_charge_is_not_zeroed(dropped):
     entry = _ptu_router(model_info=incomplete, litellm_params={"input_cost_per_token": 5e-06}).model_list[0]
 
     assert entry["litellm_params"]["input_cost_per_token"] == 5e-06
+
+
+def test_nested_custom_model_info_does_not_pollute_shared_backend():
+    backend_model = "gpt-4o-search-preview"
+    custom_id = "lit5471-search-custom"
+    sibling_id = "lit5471-search-sibling"
+    builtin_info = copy.deepcopy(litellm.get_model_info(model=backend_model))
+    expected_nested = copy.deepcopy(builtin_info["search_context_cost_per_query"])
+    model_keys = {
+        backend_model: copy.deepcopy(litellm.model_cost.get(backend_model)),
+        custom_id: copy.deepcopy(litellm.model_cost.get(custom_id)),
+        sibling_id: copy.deepcopy(litellm.model_cost.get(sibling_id)),
+    }
+    try:
+        router = Router(
+            model_list=[
+                {
+                    "model_name": "search-custom",
+                    "litellm_params": {"model": backend_model, "api_key": "fake-key"},
+                    "model_info": {
+                        "id": custom_id,
+                        "search_context_cost_per_query": {
+                            "search_context_size_low": 0.123,
+                        },
+                    },
+                },
+                {
+                    "model_name": "search-sibling",
+                    "litellm_params": {"model": backend_model, "api_key": "fake-key"},
+                    "model_info": {"id": sibling_id},
+                },
+            ],
+        )
+
+        custom_info = router.get_deployment_model_info(model_id=custom_id, model_name=backend_model)
+        sibling_info = router.get_deployment_model_info(model_id=sibling_id, model_name=backend_model)
+
+        assert custom_info is not None
+        assert custom_info["search_context_cost_per_query"]["search_context_size_low"] == 0.123
+        assert litellm.model_cost[backend_model]["search_context_cost_per_query"] == expected_nested
+        assert sibling_info is not None
+        assert sibling_info["search_context_cost_per_query"] == expected_nested
+    finally:
+        _restore_model_cost_entries(model_keys)
+        litellm.get_model_info.cache_clear()
+
+
+def test_base_model_custom_info_does_not_pollute_cached_base_model():
+    base_model = "azure/gpt-4o"
+    deployment_id = "lit5471-base-model"
+    base_model_info = copy.deepcopy(litellm.get_model_info(model=base_model))
+    model_keys = {
+        "azure/gpt-4o": copy.deepcopy(litellm.model_cost.get("azure/gpt-4o")),
+        deployment_id: copy.deepcopy(litellm.model_cost.get(deployment_id)),
+    }
+    try:
+        router = Router(
+            model_list=[
+                {
+                    "model_name": "azure-custom",
+                    "litellm_params": {
+                        "model": "gpt-4o",
+                        "custom_llm_provider": "azure",
+                        "api_key": "fake-key",
+                    },
+                    "model_info": {
+                        "id": deployment_id,
+                        "base_model": base_model,
+                        "input_cost_per_token": 0.777,
+                    },
+                }
+            ],
+        )
+
+        info = router.get_deployment_model_info(model_id=deployment_id, model_name=base_model)
+
+        assert info is not None
+        assert info["input_cost_per_token"] == 0.777
+        assert litellm.get_model_info(model=base_model) == base_model_info
+    finally:
+        _restore_model_cost_entries(model_keys)
+        litellm.get_model_info.cache_clear()
+
+
+def test_router_model_info_deep_copies_nested_cached_metadata():
+    model = "openai/gpt-4o-search-preview"
+    litellm.get_model_info.cache_clear()
+    try:
+        cached_info = litellm.get_model_info(model=model)
+        assert cached_info is not None
+        cached_nested = cached_info["search_context_cost_per_query"]
+        expected_nested = copy.deepcopy(cached_nested)
+
+        router = Router(model_list=[])
+        merged_info = router.get_router_model_info(
+            deployment={
+                "model_name": "search",
+                "litellm_params": {"model": "gpt-4o-search-preview"},
+                "model_info": {"id": "lit5471-router-model-info"},
+            },
+            received_model_name="search",
+        )
+
+        assert merged_info["search_context_cost_per_query"] is not cached_nested
+        merged_info["search_context_cost_per_query"]["search_context_size_low"] = 0.123
+        assert cached_nested == expected_nested
+        assert litellm.get_model_info(model=model)["search_context_cost_per_query"] == expected_nested
+    finally:
+        litellm.get_model_info.cache_clear()
