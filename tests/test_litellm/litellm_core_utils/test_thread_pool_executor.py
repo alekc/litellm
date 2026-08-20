@@ -1,6 +1,7 @@
 import threading
 import time
 from typing import Final
+from unittest.mock import MagicMock
 
 from litellm.constants import LOGGING_EXECUTOR_MAX_PENDING_TASKS
 from litellm.litellm_core_utils.thread_pool_executor import (
@@ -12,19 +13,21 @@ from litellm.litellm_core_utils.thread_pool_executor import (
 def test_submit_drops_tasks_when_backlog_is_full():
     release: Final = threading.Event()
     started: Final = threading.Event()
-    executed: Final[list[str]] = []
+    ran_first: Final = threading.Event()
+    ran_second: Final = threading.Event()
+    ran_dropped: Final = threading.Event()
 
-    def blocking_task(name: str) -> None:
-        executed.append(name)
+    def blocking_task(ran: threading.Event) -> None:
+        ran.set()
         started.set()
         release.wait(timeout=10)
 
     pool: Final = BoundedLoggingThreadPoolExecutor(max_workers=1, max_pending_tasks=2)
     try:
-        first: Final = pool.submit(blocking_task, "first")
+        first: Final = pool.submit(blocking_task, ran_first)
         assert started.wait(timeout=10)
-        second: Final = pool.submit(blocking_task, "second")
-        dropped: Final = pool.submit(blocking_task, "dropped")
+        second: Final = pool.submit(blocking_task, ran_second)
+        dropped: Final = pool.submit(blocking_task, ran_dropped)
 
         assert dropped.cancelled()
         assert not first.cancelled()
@@ -33,8 +36,9 @@ def test_submit_drops_tasks_when_backlog_is_full():
         release.set()
         first.result(timeout=10)
         second.result(timeout=10)
-        assert executed == ["first", "second"]
-        assert "dropped" not in executed
+        assert ran_first.is_set()
+        assert ran_second.is_set()
+        assert not ran_dropped.is_set()
     finally:
         release.set()
         pool.shutdown(wait=True)
@@ -42,11 +46,15 @@ def test_submit_drops_tasks_when_backlog_is_full():
 
 def test_submit_releases_slots_after_completion():
     pool: Final = BoundedLoggingThreadPoolExecutor(max_workers=1, max_pending_tasks=1)
+
+    def submit_and_wait() -> str:
+        future: Final = pool.submit(lambda: "ok")
+        assert not future.cancelled()
+        return future.result(timeout=10)
+
     try:
-        for _ in range(5):
-            future = pool.submit(lambda: "ok")
-            assert future.result(timeout=10) == "ok"
-            assert not future.cancelled()
+        results: Final = tuple(submit_and_wait() for _ in range(5))
+        assert results == ("ok",) * 5
     finally:
         pool.shutdown(wait=True)
 
@@ -54,12 +62,8 @@ def test_submit_releases_slots_after_completion():
 def test_drop_warning_is_rate_limited(monkeypatch):
     from litellm import _logging
 
-    warnings: Final[list[tuple[object, ...]]] = []
-    monkeypatch.setattr(
-        _logging.verbose_logger,
-        "warning",
-        lambda msg, *args: warnings.append(args),
-    )
+    warning_mock: Final = MagicMock()
+    monkeypatch.setattr(_logging.verbose_logger, "warning", warning_mock)
 
     release: Final = threading.Event()
     started: Final = threading.Event()
@@ -79,8 +83,8 @@ def test_drop_warning_is_rate_limited(monkeypatch):
         assert pool.submit(time.sleep, 0).cancelled()
         assert pool.submit(time.sleep, 0).cancelled()
 
-        assert len(warnings) == 1
-        assert warnings[0] == (1, 1)
+        assert warning_mock.call_count == 1
+        assert warning_mock.call_args.args[1:] == (1, 1)
     finally:
         release.set()
         pool.shutdown(wait=True)
