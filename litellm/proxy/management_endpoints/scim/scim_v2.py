@@ -572,27 +572,18 @@ async def _classify_group_member(member: SCIMMember, prisma_client: PrismaClient
         if team is not None and _team_metadata_has_scim_provenance(team.metadata):
             return _SkippedGroupMember(value=value, reason="existing_team")
 
-    sso_user: Final = await _table(UserRepository(prisma_client)).find_first(
-        where=MappingProxyType({"sso_user_id": value})
-    )
-    if sso_user is not None:
-        verbose_proxy_logger.info(
-            "SCIM: group member '%s' matched user_id '%s' by sso_user_id",
-            value,
-            sso_user.user_id,
+    for attribute in ("sso_user_id", "user_email"):
+        fallback_user = await _table(UserRepository(prisma_client)).find_first(
+            where=MappingProxyType({attribute: value})
         )
-        return _ResolvedUserMember(user_id=sso_user.user_id)
-
-    email_user: Final = await _table(UserRepository(prisma_client)).find_first(
-        where=MappingProxyType({"user_email": value})
-    )
-    if email_user is not None:
-        verbose_proxy_logger.info(
-            "SCIM: group member '%s' matched user_id '%s' by user_email",
-            value,
-            email_user.user_id,
-        )
-        return _ResolvedUserMember(user_id=email_user.user_id)
+        if fallback_user is not None:
+            verbose_proxy_logger.info(
+                "SCIM: group member '%s' matched user_id '%s' by %s",
+                value,
+                fallback_user.user_id,
+                attribute,
+            )
+            return _ResolvedUserMember(user_id=fallback_user.user_id)
 
     return _UnknownMember(value=value)
 
