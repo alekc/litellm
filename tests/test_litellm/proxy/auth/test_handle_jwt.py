@@ -18,6 +18,7 @@ from litellm.proxy._types import (
     ProxyErrorTypes,
     ProxyException,
 )
+from litellm.caching.dual_cache import DualCache
 from litellm.proxy.auth.handle_jwt import (
     STALE_CACHE_KEY_PREFIX,
     JWTAuthManager,
