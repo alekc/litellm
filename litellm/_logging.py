@@ -170,7 +170,7 @@ class StdoutLogTruncationFilter(logging.Filter):
             record.msg = _truncate_for_stdout_log(message, limit)  # rebind-ok: the Filter interface mutates the record
             record.args = None  # rebind-ok: args are consumed by the truncated message above
 
-        if record.exc_info is not None:
+        if isinstance(record.exc_info, tuple):
             exc_text: Final = record.exc_text or self._formatter.formatException(record.exc_info)
             if len(exc_text) > limit:
                 record.exc_text = _truncate_for_stdout_log(  # rebind-ok: the Filter interface mutates the record
