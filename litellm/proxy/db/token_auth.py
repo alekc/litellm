@@ -243,12 +243,26 @@ def build_azure_entra_token_provider() -> Callable[[], str]:
     Cached because the writer URL, the reader URL, and the refresh loop each ask for a
     strategy, and every uncached call would build another Azure credential with its own
     HTTP transport and its own token cache that nothing ever closes.
+
+    ``DefaultAzureCredential`` is pinned rather than left to the shared provider's
+    inference, because that inference reads a bare ``AZURE_CLIENT_ID`` as managed
+    identity and talks to IMDS. AKS workload identity injects ``AZURE_CLIENT_ID``
+    alongside ``AZURE_FEDERATED_TOKEN_FILE`` on a pod that has no IMDS, so inference
+    would mint through the wrong credential and fail; ``DefaultAzureCredential``'s
+    own chain resolves workload identity, managed identity, ``az login``, and env
+    var-driven service principals in turn.
     """
     from litellm.secret_managers.get_azure_ad_token_provider import (
         get_azure_ad_token_provider,
     )
+    from litellm.types.secret_managers.get_azure_ad_token_provider import (
+        AzureCredentialType,
+    )
 
-    return get_azure_ad_token_provider(azure_scope=AZURE_POSTGRESQL_SCOPE)
+    return get_azure_ad_token_provider(
+        azure_scope=AZURE_POSTGRESQL_SCOPE,
+        azure_credential=AzureCredentialType.DefaultAzureCredential,
+    )
 
 
 def build_database_token_auth(*, iam_token_db_auth: bool, azure_postgresql_auth: bool) -> DatabaseTokenAuth | None:

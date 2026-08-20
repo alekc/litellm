@@ -252,14 +252,46 @@ def test_resolve_raises_when_both_toggles_are_set(monkeypatch):
 
 def test_entra_provider_uses_the_ossrdbms_scope():
     """The wrong scope mints a token Azure Postgres rejects, so the scope is pinned."""
+    from litellm.types.secret_managers.get_azure_ad_token_provider import (
+        AzureCredentialType,
+    )
+
     with patch(
         "litellm.secret_managers.get_azure_ad_token_provider.get_azure_ad_token_provider",
         return_value=lambda: "ENTRA_TOKEN",
     ) as get_provider:
         build_azure_entra_token_provider()
 
-    get_provider.assert_called_once_with(azure_scope="https://ossrdbms-aad.database.windows.net/.default")
+    get_provider.assert_called_once_with(
+        azure_scope="https://ossrdbms-aad.database.windows.net/.default",
+        azure_credential=AzureCredentialType.DefaultAzureCredential,
+    )
     assert AZURE_POSTGRESQL_SCOPE == "https://ossrdbms-aad.database.windows.net/.default"
+
+
+def test_entra_provider_forces_default_credential_on_workload_identity(monkeypatch):
+    """AKS workload identity injects ``AZURE_CLIENT_ID`` + ``AZURE_FEDERATED_TOKEN_FILE``
+    on a pod that has no IMDS. The shared provider's inference reads a bare
+    ``AZURE_CLIENT_ID`` as ``ManagedIdentityCredential``, so leaving inference on would
+    talk to IMDS and fail. ``DefaultAzureCredential``'s own chain resolves workload
+    identity first, so pinning it is what makes the WI mode this feature advertises
+    actually mint a token."""
+    monkeypatch.setenv("AZURE_CLIENT_ID", "wi-client-id")
+    monkeypatch.setenv("AZURE_TENANT_ID", "wi-tenant-id")
+    monkeypatch.setenv("AZURE_FEDERATED_TOKEN_FILE", "/var/run/secrets/azure/tokens/azure-identity-token")
+    monkeypatch.delenv("AZURE_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("AZURE_CREDENTIAL", raising=False)
+
+    with patch("azure.identity.DefaultAzureCredential") as default_cred, patch(
+        "azure.identity.ManagedIdentityCredential"
+    ) as managed_cred, patch(
+        "azure.identity.get_bearer_token_provider",
+        return_value=lambda: "ENTRA_TOKEN",
+    ):
+        build_azure_entra_token_provider()
+
+    default_cred.assert_called_once_with()
+    managed_cred.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
