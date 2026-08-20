@@ -4269,6 +4269,38 @@ async def test_auth_jwt_issuer_path_expired_token_raises_401(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_auth_jwt_issuer_path_unreachable_jwks_raises_503(monkeypatch):
+    """The issuer-scoped path must report an unreachable IdP as 503, not as a credential failure."""
+    monkeypatch.delenv("JWT_AUDIENCE", raising=False)
+    monkeypatch.delenv("JWT_PUBLIC_KEY_URL", raising=False)
+
+    issuer = "https://unreachable-issuer.example.com"
+    jwks_url = f"{issuer}/keys"
+    private_key, _ = _get_rsa_key_and_jwk(kid="unreachable-kid")
+
+    jwt_handler = _get_jwt_handler_with_issuer_keys(
+        issuers=[{"issuer": issuer, "jwks_url": jwks_url, "audience": "my-audience"}],
+        keys_by_url={},
+    )
+    endpoint = _ScriptedJWKSEndpoint((httpx.ConnectTimeout("connect timed out"),))
+    jwt_handler.http_handler = endpoint
+
+    token = _encode_rsa_jwt(
+        private_key=private_key,
+        issuer=issuer,
+        audience="my-audience",
+        kid="unreachable-kid",
+    )
+
+    with pytest.raises(ProxyException) as exc_info:
+        await jwt_handler.auth_jwt(token=token)
+
+    assert exc_info.value.code == "503"
+    assert exc_info.value.type == ProxyErrorTypes.auth_provider_unavailable
+    assert endpoint.call_count == 3
+
+
+@pytest.mark.asyncio
 async def test_multi_issuer_jwt_maps_kubernetes_namespace_claim(monkeypatch):
     monkeypatch.delenv("JWT_AUDIENCE", raising=False)
     monkeypatch.delenv("JWT_PUBLIC_KEY_URL", raising=False)
