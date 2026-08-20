@@ -35,12 +35,8 @@ else:
 
 
 def _with_requester_ip_address(request_data: dict, requester_ip: str | None) -> dict:
-    """Return ``request_data`` with the caller IP stamped into its logging metadata.
-
-    Auth gate rejections (401s, budget 429s) are raised before
-    ``add_litellm_data_to_request`` records the caller IP, so failure logs for them
-    would otherwise carry no IP, and a 401 usually has no key/user identity either.
-    """
+    """Auth gate rejections are raised before `add_litellm_data_to_request` records the
+    caller IP, so their failure logs would otherwise carry no IP nor key/user identity."""
     if not requester_ip:
         return request_data
     key: Final = "litellm_metadata" if "litellm_metadata" in request_data else "metadata"
