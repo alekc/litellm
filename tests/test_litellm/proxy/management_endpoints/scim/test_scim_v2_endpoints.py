@@ -1,5 +1,6 @@
+import logging
 import time
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 from fastapi import HTTPException
@@ -1553,6 +1554,7 @@ async def test_create_group_with_nonexistent_users_rejects(mocker, monkeypatch):
         return None  # new-user-1 and new-user-2 don't exist
 
     mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(side_effect=mock_user_lookup)
+    mock_prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
 
     # Mock dependencies
     mocker.patch(
@@ -1637,6 +1639,7 @@ async def test_update_group_with_nonexistent_users_rejects(mocker, monkeypatch):
         return None  # new-user-3 and new-user-4 don't exist
 
     mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(side_effect=mock_user_lookup)
+    mock_prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
 
     # Mock dependencies
     mocker.patch(
@@ -1706,6 +1709,7 @@ async def test_create_group_with_nonexistent_users_creates_when_flag_true(mocker
         return None  # new-user-1 and new-user-2 don't exist
 
     mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(side_effect=mock_user_lookup)
+    mock_prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
 
     # Mock user creation
     created_user_1 = NewUserResponse(user_id="new-user-1", key="test-key-1")
@@ -1794,6 +1798,7 @@ async def test_extract_group_member_ids_with_flag_true_creates_users(mocker, mon
         return None  # new-user-1 doesn't exist
 
     mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(side_effect=mock_user_lookup)
+    mock_prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
 
     # Mock user creation
     created_user = NewUserResponse(user_id="new-user-1", key="test-key-1")
@@ -1862,6 +1867,7 @@ async def test_extract_group_member_ids_with_flag_false_rejects(mocker, monkeypa
         return None  # new-user-1 doesn't exist
 
     mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(side_effect=mock_user_lookup)
+    mock_prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
 
     # Mock dependencies
     mocker.patch(
@@ -1911,6 +1917,7 @@ async def test_process_group_patch_operations_with_flag_true_creates_users(mocke
 
     # Mock user lookup - new-user-1 doesn't exist
     mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(return_value=None)
+    mock_prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
     mock_prisma_client.db.litellm_teamtable.find_unique = AsyncMock(return_value=None)
 
     # Mock user creation
@@ -1966,6 +1973,7 @@ async def test_process_group_patch_operations_with_flag_false_rejects(mocker, mo
 
     # Mock user lookup - new-user-1 doesn't exist
     mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(return_value=None)
+    mock_prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
     mock_prisma_client.db.litellm_teamtable.find_unique = AsyncMock(return_value=None)
 
     # Execute the function - should raise HTTPException
@@ -3532,7 +3540,15 @@ async def test_process_group_patch_replace_empty_value_does_not_use_path_filter(
     assert final_members == set()
 
 
-def _member_resolution_prisma(mocker, *, users: set, teams: set, unmanaged_teams: frozenset = frozenset()):
+def _member_resolution_prisma(
+    mocker,
+    *,
+    users: set,
+    teams: set,
+    unmanaged_teams: frozenset = frozenset(),
+    email_to_user_id: dict[str, str] | None = None,
+    sso_user_id_to_user_id: dict[str, str] | None = None,
+):
     """Prisma mock where only the given ids resolve to a user row / team row.
 
     ``teams`` are teams a SCIM group write created, so they carry provenance;
@@ -3554,6 +3570,21 @@ def _member_resolution_prisma(mocker, *, users: set, teams: set, unmanaged_teams
             LiteLLM_UserTable(user_id=where["user_id"]) if where["user_id"] in users else None
         )
     )
+
+    def fallback_user_row(where):
+        if (
+            "sso_user_id" in where
+            and sso_user_id_to_user_id is not None
+            and where["sso_user_id"] in sso_user_id_to_user_id
+        ):
+            sso_user_id = where["sso_user_id"]
+            return LiteLLM_UserTable(user_id=sso_user_id_to_user_id[sso_user_id], sso_user_id=sso_user_id)
+        if "user_email" in where and email_to_user_id is not None and where["user_email"] in email_to_user_id:
+            user_email = where["user_email"]
+            return LiteLLM_UserTable(user_id=email_to_user_id[user_email], user_email=user_email)
+        return None
+
+    prisma_client.db.litellm_usertable.find_first = AsyncMock(side_effect=fallback_user_row)
     prisma_client.db.litellm_teamtable = mocker.MagicMock()
     prisma_client.db.litellm_teamtable.find_unique = AsyncMock(side_effect=lambda where: team_row(where["team_id"]))
     return prisma_client
@@ -4324,6 +4355,127 @@ async def test_resolve_group_member_ids_dedupes_repeated_member(mocker, scim_ups
     )
 
     assert result.all_member_ids == ["dup-user"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_group_member_ids_matches_sso_user_id(mocker, scim_upsert_user_enabled):
+    """An OIDC subject in a group payload must resolve to the existing user's
+    internal id instead of provisioning a placeholder."""
+    prisma_client = _member_resolution_prisma(
+        mocker,
+        users=set(),
+        teams=set(),
+        email_to_user_id={"member-sub": "email-user"},
+        sso_user_id_to_user_id={"member-sub": "sso-user"},
+    )
+    create_user_mock = mocker.patch(
+        "litellm.proxy.management_endpoints.scim.scim_v2._create_user_if_not_exists",
+        AsyncMock(),
+    )
+
+    result = await _resolve_group_member_ids(
+        members=[SCIMMember(value="member-sub")],
+        created_via="scim_group_membership",
+        prisma_client=prisma_client,
+    )
+
+    create_user_mock.assert_not_called()
+    assert result.existing_member_ids == ["sso-user"]
+    assert result.created_users == []
+    assert result.all_member_ids == ["sso-user"]
+    assert prisma_client.db.litellm_usertable.find_first.await_args_list == [
+        call(where={"sso_user_id": "member-sub"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_group_member_ids_matches_user_email(mocker, scim_upsert_user_enabled):
+    """A group member email must resolve to the existing user's internal id
+    when the identity provider sends email rather than the user id."""
+    prisma_client = _member_resolution_prisma(
+        mocker,
+        users=set(),
+        teams=set(),
+        email_to_user_id={"member@example.com": "email-user"},
+    )
+    create_user_mock = mocker.patch(
+        "litellm.proxy.management_endpoints.scim.scim_v2._create_user_if_not_exists",
+        AsyncMock(),
+    )
+
+    result = await _resolve_group_member_ids(
+        members=[SCIMMember(value="member@example.com")],
+        created_via="scim_group_membership",
+        prisma_client=prisma_client,
+    )
+
+    create_user_mock.assert_not_called()
+    assert result.existing_member_ids == ["email-user"]
+    assert result.created_users == []
+    assert result.all_member_ids == ["email-user"]
+    assert prisma_client.db.litellm_usertable.find_first.await_args_list == [
+        call(where={"sso_user_id": "member@example.com"}),
+        call(where={"user_email": "member@example.com"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_group_member_ids_exact_user_id_skips_fallbacks(mocker, scim_upsert_user_enabled):
+    """The canonical user id lookup remains authoritative and avoids fallback queries."""
+    prisma_client = _member_resolution_prisma(
+        mocker,
+        users={"member-id"},
+        teams=set(),
+        email_to_user_id={"member-id": "email-user"},
+        sso_user_id_to_user_id={"member-id": "sso-user"},
+    )
+    create_user_mock = mocker.patch(
+        "litellm.proxy.management_endpoints.scim.scim_v2._create_user_if_not_exists",
+        AsyncMock(),
+    )
+
+    result = await _resolve_group_member_ids(
+        members=[SCIMMember(value="member-id")],
+        created_via="scim_group_membership",
+        prisma_client=prisma_client,
+    )
+
+    create_user_mock.assert_not_called()
+    assert result.existing_member_ids == ["member-id"]
+    assert result.all_member_ids == ["member-id"]
+    prisma_client.db.litellm_usertable.find_first.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_group_member_ids_warns_before_creating_unmatched_placeholder(
+    mocker, scim_upsert_user_enabled, caplog
+):
+    """An unmatched member still follows upsert behavior, but operators receive
+    a warning before the placeholder can leave an SSO user teamless."""
+    prisma_client = _member_resolution_prisma(mocker, users=set(), teams=set())
+    create_user_mock = mocker.patch(
+        "litellm.proxy.management_endpoints.scim.scim_v2._create_user_if_not_exists",
+        AsyncMock(return_value=NewUserResponse(user_id="placeholder", key="placeholder-key")),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"):
+        result = await _resolve_group_member_ids(
+            members=[SCIMMember(value="unmatched-id")],
+            created_via="scim_group_membership",
+            prisma_client=prisma_client,
+        )
+
+    create_user_mock.assert_awaited_once_with(user_id="unmatched-id", created_via="scim_group_membership")
+    assert result.existing_member_ids == []
+    assert result.created_users == [NewUserResponse(user_id="placeholder", key="placeholder-key")]
+    assert result.all_member_ids == ["unmatched-id"]
+    assert any(
+        record.levelno >= logging.WARNING
+        and "unmatched-id" in record.getMessage()
+        and "matched no user by user_id, sso_user_id or user_email" in record.getMessage()
+        and "real account stays teamless" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.parametrize(

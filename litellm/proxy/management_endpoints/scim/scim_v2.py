@@ -7,6 +7,7 @@ This is an enterprise feature and requires a premium license.
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import chain
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, NamedTuple, Protocol, overload
 
 from fastapi import (
@@ -548,6 +549,10 @@ async def _classify_group_member(member: SCIMMember, prisma_client: PrismaClient
       one the identity provider writes. An id the IdP called a User is a user
       even if some team happens to share the id, and a team created here rather
       than through SCIM is not evidence of anything about the member.
+
+    When those checks miss on an otherwise user-shaped member, its value is also
+    looked up as ``sso_user_id`` and then ``user_email`` before it is treated as
+    unknown. Fallback matches resolve to the matched user's ``user_id``.
     """
     value: Final = _member_value(member)
     member_type: Final = _normalized_member_type(member)
@@ -566,6 +571,28 @@ async def _classify_group_member(member: SCIMMember, prisma_client: PrismaClient
         team: Final = await _table(TeamRepository(prisma_client)).find_unique(where={"team_id": value})
         if team is not None and _team_metadata_has_scim_provenance(team.metadata):
             return _SkippedGroupMember(value=value, reason="existing_team")
+
+    sso_user: Final = await _table(UserRepository(prisma_client)).find_first(
+        where=MappingProxyType({"sso_user_id": value})
+    )
+    if sso_user is not None:
+        verbose_proxy_logger.info(
+            "SCIM: group member '%s' matched user_id '%s' by sso_user_id",
+            value,
+            sso_user.user_id,
+        )
+        return _ResolvedUserMember(user_id=sso_user.user_id)
+
+    email_user: Final = await _table(UserRepository(prisma_client)).find_first(
+        where=MappingProxyType({"user_email": value})
+    )
+    if email_user is not None:
+        verbose_proxy_logger.info(
+            "SCIM: group member '%s' matched user_id '%s' by user_email",
+            value,
+            email_user.user_id,
+        )
+        return _ResolvedUserMember(user_id=email_user.user_id)
 
     return _UnknownMember(value=value)
 
@@ -627,11 +654,12 @@ async def _resolve_group_member_ids(
     """
     Resolve SCIM group members to LiteLLM user ids, dropping members that are not users.
 
-    Only the operations that put ids onto a roster resolve their members: an id
-    that resolves to nothing is created when litellm_settings.scim_upsert_user is
-    True (default) and rejected per SCIM 2.0 otherwise. Removals do not come
-    through here; dropping an id is idempotent, so it needs neither a lookup nor a
-    user to drop.
+    Member ids are matched by ``user_id``, then ``sso_user_id``, then
+    ``user_email``. Only the operations that put ids onto a roster resolve their
+    members: an id that resolves to nothing is created when
+    litellm_settings.scim_upsert_user is True (default) and rejected per SCIM 2.0
+    otherwise. Removals do not come through here; dropping an id is idempotent, so
+    it needs neither a lookup nor a user to drop.
 
     Raises:
         HTTPException: 400 when a member id is empty, or when scim_upsert_user is
@@ -655,6 +683,13 @@ async def _resolve_group_member_ids(
                 "error": f"User with ID '{partition.unknown_ids[0]}' does not exist. "
                 "Please create the user first via POST /Users before adding to group."
             },
+        )
+
+    for user_id in partition.unknown_ids:
+        verbose_proxy_logger.warning(
+            "SCIM: creating placeholder user for group member '%s'; matched no user by user_id, sso_user_id or "
+            "user_email. An SSO-provisioned user's real account stays teamless if this is a mismatch",
+            user_id,
         )
 
     creations: Final = tuple(
