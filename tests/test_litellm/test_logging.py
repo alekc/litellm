@@ -20,6 +20,7 @@ from litellm._logging import (
     CorrelationContextFilter,
     CorrelationPlainFormatter,
     JsonFormatter,
+    StdoutLogTruncationFilter,
     _initialize_loggers_with_handler,
     _turn_on_json,
     session_id_var,
@@ -30,6 +31,7 @@ from litellm._logging import (
     verbose_proxy_logger,
     verbose_router_logger,
 )
+from litellm.constants import LITELLM_TRUNCATED_PAYLOAD_FIELD
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.types.utils import StandardLoggingPayload
 
@@ -664,6 +666,92 @@ def test_set_trace_id_strips_control_characters():
         assert "\n" not in value
     finally:
         trace_id_var.reset(token)
+
+
+def _make_record(level: int, msg: str, args=(), exc_info=None) -> logging.LogRecord:
+    return logging.LogRecord(
+        name="LiteLLM Router",
+        level=level,
+        pathname="",
+        lineno=0,
+        msg=msg,
+        args=args,
+        exc_info=exc_info,
+    )
+
+
+def test_oversized_info_record_is_truncated(monkeypatch):
+    """An error string echoing a huge request payload must not reach stdout in full."""
+    monkeypatch.setenv("MAX_STRING_LENGTH_STDOUT_LOG", "500")
+    payload = "p" * 100_000
+    record = _make_record(logging.INFO, "litellm.acompletion(model=%s) Exception %s", ("gpt-4", payload))
+
+    assert StdoutLogTruncationFilter().filter(record) is True
+
+    message = record.getMessage()
+    assert LITELLM_TRUNCATED_PAYLOAD_FIELD in message
+    assert f"skipped {43 + len(payload) - 500} chars" in message
+    assert len(message) < 1000
+    assert message.startswith("litellm.acompletion(model=gpt-4) Exception ppp")
+    assert message.endswith("p" * 250)
+
+
+def test_debug_record_is_not_truncated(monkeypatch):
+    """--detailed_debug exists to dump full payloads, so DEBUG records pass through."""
+    monkeypatch.setenv("MAX_STRING_LENGTH_STDOUT_LOG", "500")
+    payload = "p" * 100_000
+    record = _make_record(logging.DEBUG, "raw request %s", (payload,))
+
+    assert StdoutLogTruncationFilter().filter(record) is True
+
+    assert record.getMessage() == f"raw request {payload}"
+
+
+def test_truncation_disabled_by_zero_limit(monkeypatch):
+    monkeypatch.setenv("MAX_STRING_LENGTH_STDOUT_LOG", "0")
+    payload = "p" * 100_000
+    record = _make_record(logging.ERROR, "Exception %s", (payload,))
+
+    assert StdoutLogTruncationFilter().filter(record) is True
+
+    assert record.getMessage() == f"Exception {payload}"
+
+
+def test_oversized_traceback_is_truncated(monkeypatch):
+    """verbose_proxy_logger.exception() re-logs the payload inside the traceback too."""
+    monkeypatch.setenv("MAX_STRING_LENGTH_STDOUT_LOG", "500")
+    try:
+        raise ValueError("payload " + "p" * 100_000)
+    except ValueError:
+        exc_info = sys.exc_info()
+    record = _make_record(logging.ERROR, "Exception occured", exc_info=exc_info)
+
+    assert StdoutLogTruncationFilter().filter(record) is True
+
+    assert record.exc_text is not None
+    assert LITELLM_TRUNCATED_PAYLOAD_FIELD in record.exc_text
+    assert len(record.exc_text) < 1000
+    assert "Traceback (most recent call last)" in record.exc_text
+
+
+def test_truncation_filter_survives_json_reconfiguration():
+    """The cap lives on the loggers, so swapping handlers (JSON mode) can't drop it."""
+    _turn_on_json()
+
+    for lg in (verbose_logger, verbose_router_logger, verbose_proxy_logger):
+        assert any(isinstance(f, StdoutLogTruncationFilter) for f in lg.filters), f"{lg.name} lost stdout truncation"
+
+
+def test_oversized_error_is_truncated_end_to_end(monkeypatch, caplog):
+    """The router's own exception log line must come out bounded, not just the filter in isolation."""
+    monkeypatch.setenv("MAX_STRING_LENGTH_STDOUT_LOG", "500")
+
+    with caplog.at_level(logging.INFO, logger="LiteLLM Router"):
+        verbose_router_logger.info("litellm.acompletion(model=%s) Exception %s", "gpt-4", "p" * 100_000)
+
+    emitted = "".join(record.getMessage() for record in caplog.records)
+    assert LITELLM_TRUNCATED_PAYLOAD_FIELD in emitted
+    assert len(emitted) < 1000
 
 
 def test_set_session_id_bounds_length():
