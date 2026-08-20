@@ -198,7 +198,6 @@ class UserProvisionerHelpers:
             user_id=new_user_request.user_id,
             existing_teams=existing_user.teams or [],
             new_teams=new_teams,
-            raise_on_error=True,
         )
 
         updated_user: Final = await _table(UserRepository(prisma_client)).update(
@@ -715,9 +714,12 @@ async def _handle_team_membership_changes(
     user_id: str,
     existing_teams: list[str],
     new_teams: list[str],
-    raise_on_error: bool = False,
 ) -> None:
-    """Handle adding/removing user from teams based on changes."""
+    """Handle adding/removing user from teams based on changes.
+
+    Roster write failures propagate so the SCIM endpoint returns an error the IdP
+    retries, instead of persisting a ``teams`` array the roster never received.
+    """
     existing_teams_set: Final = set(existing_teams)
     new_teams_set: Final = set(new_teams)
 
@@ -729,7 +731,7 @@ async def _handle_team_membership_changes(
             user_id=user_id,
             teams_ids_to_add_user_to=list(teams_to_add),
             teams_ids_to_remove_user_from=list(teams_to_remove),
-            raise_on_error=raise_on_error,
+            raise_on_error=True,
         )
 
 
@@ -2371,7 +2373,11 @@ async def _apply_group_patch_updates(group_id: str, update_data: dict[str, objec
 
 
 async def _handle_group_membership_changes(group_id: str, current_members: set[str], final_members: set[str]):
-    """Handle adding/removing members from the group."""
+    """Handle adding/removing members from the group.
+
+    Roster write failures propagate so the SCIM endpoint returns an error and the
+    IdP retries the push, instead of reporting a membership sync that never landed.
+    """
     members_to_add: Final = final_members - current_members
     members_to_remove: Final = current_members - final_members
 
@@ -2384,6 +2390,7 @@ async def _handle_group_membership_changes(group_id: str, current_members: set[s
             user_id=member_id,
             teams_ids_to_add_user_to=[group_id],
             teams_ids_to_remove_user_from=[],
+            raise_on_error=True,
         )
 
     for member_id in members_to_remove:
@@ -2391,6 +2398,7 @@ async def _handle_group_membership_changes(group_id: str, current_members: set[s
             user_id=member_id,
             teams_ids_to_add_user_to=[],
             teams_ids_to_remove_user_from=[group_id],
+            raise_on_error=True,
         )
 
 
