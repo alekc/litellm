@@ -323,6 +323,12 @@ DEFAULT_MOCK_RESPONSE_PROMPT_TOKEN_COUNT: Final = int(os.getenv("DEFAULT_MOCK_RE
 DEFAULT_MOCK_RESPONSE_COMPLETION_TOKEN_COUNT: Final = int(os.getenv("DEFAULT_MOCK_RESPONSE_COMPLETION_TOKEN_COUNT", 20))
 MAX_SHORT_SIDE_FOR_IMAGE_HIGH_RES: Final = int(os.getenv("MAX_SHORT_SIDE_FOR_IMAGE_HIGH_RES", 768))
 MAX_LONG_SIDE_FOR_IMAGE_HIGH_RES: Final = int(os.getenv("MAX_LONG_SIDE_FOR_IMAGE_HIGH_RES", 2000))
+# tiktoken's BPE merge loop is quadratic in the length of a single regex piece, so a long run of one
+# repeated character (dot leaders, whitespace, zero-padded base64) can take minutes on a multi-MB payload.
+# Text longer than this is encoded in chunks of this size, which caps the cost at ~1 token of drift per boundary.
+TIKTOKEN_ENCODE_CHUNK_SIZE_CHARS: Final = int(
+    os.getenv("TIKTOKEN_ENCODE_CHUNK_SIZE_CHARS", 1024)  # noqa: PLW1508  # match adjacent numeric defaults
+)
 MAX_TILE_WIDTH: Final = int(os.getenv("MAX_TILE_WIDTH", 512))
 MAX_TILE_HEIGHT: Final = int(os.getenv("MAX_TILE_HEIGHT", 512))
 OPENAI_FILE_SEARCH_COST_PER_1K_CALLS: Final = float(os.getenv("OPENAI_FILE_SEARCH_COST_PER_1K_CALLS", 2.5 / 1000))

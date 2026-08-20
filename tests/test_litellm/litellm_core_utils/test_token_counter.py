@@ -7,6 +7,7 @@ import traceback
 from unittest.mock import MagicMock
 
 import pytest
+import tiktoken
 
 sys.path.insert(
     0, os.path.abspath("../../..")
@@ -52,6 +53,41 @@ def test_token_counter_basic():
         )
         == 19
     )
+
+
+def test_token_counter_large_repeated_text_is_fast():
+    messages = [{"role": "user", "content": [{"type": "text", "text": "A" * 1024 * 1024}]}]
+
+    start_time = time.perf_counter()
+    tokens = token_counter_new(model="us.anthropic.claude-sonnet-4-6", messages=messages)
+    elapsed = time.perf_counter() - start_time
+
+    assert elapsed < 2, f"Token counting took too long: {elapsed:.2f}s"
+    assert tokens > 0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Short text",
+        "This is a normal message with punctuation, numbers, and a few words.",
+    ],
+)
+def test_token_counter_short_text_matches_tiktoken(text):
+    encoding = tiktoken.get_encoding("cl100k_base")
+    expected = len(encoding.encode(text, disallowed_special=()))
+
+    assert token_counter_new(model="us.anthropic.claude-sonnet-4-6", text=text) == expected
+
+
+def test_token_counter_text_over_chunk_boundary_stays_close_to_tiktoken():
+    text = ("The quick brown fox jumps over the lazy dog. " * 30)[:1025]
+    encoding = tiktoken.get_encoding("cl100k_base")
+    expected = len(encoding.encode(text, disallowed_special=()))
+
+    actual = token_counter_new(model="us.anthropic.claude-sonnet-4-6", text=text)
+
+    assert abs(actual - expected) <= 4
 
 
 def test_token_counter_with_prefix():
