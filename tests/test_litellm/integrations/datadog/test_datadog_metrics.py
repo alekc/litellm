@@ -48,7 +48,7 @@ async def test_extract_tags(clean_env):
         custom_llm_provider="openai",
         model="gpt-4o",
         model_group="gpt-4",
-        metadata={"user_api_key_team_alias": "P&T"},
+        metadata={"user_api_key_team_alias": "test-team"},
     )
 
     tags = logger._extract_tags(log=payload, status_code="200")
@@ -60,7 +60,23 @@ async def test_extract_tags(clean_env):
     assert "model_name:gpt-4o" in tags
     assert "model_group:gpt-4" in tags
     assert "status_code:200" in tags
-    assert "team:p_t" in tags
+    assert "team:test-team" in tags
+
+
+@pytest.mark.asyncio
+async def test_extract_tags_normalizes_team_alias(clean_env):
+    """Team aliases with uppercase or special characters match what Datadog stores."""
+    logger = DatadogMetricsLogger(start_periodic_flush=False)
+
+    payload = StandardLoggingPayload(
+        custom_llm_provider="openai",
+        model="gpt-4o",
+        metadata={"user_api_key_team_alias": "P&T CTO-B2B"},
+    )
+
+    tags = logger._extract_tags(log=payload, status_code="200")
+
+    assert "team:p_t_cto-b2b" in tags
 
 
 @pytest.mark.asyncio
