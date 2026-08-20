@@ -3731,6 +3731,11 @@ class ProxyErrorTypes(str, enum.Enum):
     General authentication error
     """
 
+    auth_provider_unavailable = "auth_provider_unavailable"
+    """
+    The identity provider needed to authenticate the request (e.g. its JWKS endpoint) is unreachable
+    """
+
     internal_server_error = "internal_server_error"
     """
     Internal server error
@@ -3821,6 +3826,7 @@ class ProxyErrorTypes(str, enum.Enum):
 
 DB_CONNECTION_ERROR_TYPES: Final = (
     httpx.ConnectError,
+    httpx.ConnectTimeout,
     httpx.ReadError,
     httpx.ReadTimeout,
 )

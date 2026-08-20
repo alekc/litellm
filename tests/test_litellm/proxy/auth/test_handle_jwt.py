@@ -1,7 +1,10 @@
+import asyncio
+from collections.abc import Mapping, Sequence
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException
+import httpx
 import pytest
 
 from litellm.proxy._types import (
@@ -3934,6 +3937,131 @@ async def test_get_public_key_fetches_and_caches_jwks_response():
         key="litellm_jwt_auth_keys_https://issuer.example.com/keys"
     )
     assert cached_keys == [jwk]
+
+
+class _ScriptedJWKSEndpoint:
+    """Injected stand-in for ``JWTHandler.http_handler`` with scripted per-call outcomes.
+
+    Each outcome is either an exception to raise or a JSON body to return; the
+    last outcome repeats for any further calls.
+    """
+
+    def __init__(self, outcomes: Sequence[Exception | Mapping[str, object]], delay: float = 0.0) -> None:
+        self.outcomes = outcomes
+        self.delay = delay
+        self.call_count = 0
+
+    async def get(
+        self,
+        url: str,
+        params: Mapping[str, str] | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> MagicMock:
+        self.call_count += 1
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        outcome = self.outcomes[min(self.call_count - 1, len(self.outcomes) - 1)]
+        if isinstance(outcome, Exception):
+            raise outcome
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = outcome
+        return response
+
+
+def _get_jwt_handler_with_scripted_endpoint(
+    cache: "DualCache",
+    endpoint: _ScriptedJWKSEndpoint,
+    public_key_ttl: float = 600,
+) -> JWTHandler:
+    jwt_handler = JWTHandler()
+    jwt_handler.update_environment(
+        prisma_client=None,
+        user_api_key_cache=cache,
+        litellm_jwtauth=LiteLLM_JWTAuth(public_key_ttl=public_key_ttl),
+    )
+    jwt_handler.http_handler = endpoint
+    return jwt_handler
+
+
+@pytest.mark.asyncio
+async def test_get_public_key_retries_transient_jwks_fetch_failure():
+    """A single connect timeout to the IdP must be retried, not surfaced to the caller."""
+    from litellm.caching.dual_cache import DualCache
+
+    _, jwk = _get_rsa_key_and_jwk(kid="retried-key")
+    endpoint = _ScriptedJWKSEndpoint((httpx.ConnectTimeout("connect timed out"), {"keys": [jwk]}))
+    jwt_handler = _get_jwt_handler_with_scripted_endpoint(DualCache(), endpoint)
+
+    public_key = await jwt_handler._get_public_key_from_jwks_url(
+        jwks_url="https://issuer.example.com/keys",
+        kid="retried-key",
+    )
+
+    assert public_key == jwk
+    assert endpoint.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_get_public_key_serves_stale_keys_when_jwks_refresh_fails():
+    """Once the TTL lapses, an unreachable IdP must not invalidate a still-valid signing key."""
+    from litellm.caching.dual_cache import DualCache
+
+    jwks_url = "https://issuer.example.com/keys"
+    _, jwk = _get_rsa_key_and_jwk(kid="stale-key")
+    cache = DualCache()
+    endpoint = _ScriptedJWKSEndpoint(({"keys": [jwk]},))
+    jwt_handler = _get_jwt_handler_with_scripted_endpoint(cache, endpoint)
+
+    assert await jwt_handler._get_public_key_from_jwks_url(jwks_url=jwks_url, kid="stale-key") == jwk
+
+    await cache.async_delete_cache(key=f"litellm_jwt_auth_keys_{jwks_url}")
+    endpoint.outcomes = (httpx.ConnectTimeout("connect timed out"),)
+
+    public_key = await jwt_handler._get_public_key_from_jwks_url(jwks_url=jwks_url, kid="stale-key")
+
+    assert public_key == jwk
+
+
+@pytest.mark.asyncio
+async def test_get_public_key_raises_503_when_jwks_unreachable_and_no_cached_keys(monkeypatch):
+    """An unreachable IdP is an infra failure: 503, never a 401 that clients read as bad credentials."""
+    from litellm.caching.dual_cache import DualCache
+
+    monkeypatch.setenv("JWT_PUBLIC_KEY_URL", "https://issuer.example.com/keys")
+    endpoint = _ScriptedJWKSEndpoint((httpx.ConnectTimeout("connect timed out"),))
+    jwt_handler = _get_jwt_handler_with_scripted_endpoint(DualCache(), endpoint)
+
+    with pytest.raises(ProxyException) as exc_info:
+        await jwt_handler.get_public_key(kid="any-key")
+
+    assert exc_info.value.code == "503"
+    assert exc_info.value.type == ProxyErrorTypes.auth_provider_unavailable
+    assert "ConnectTimeout" in exc_info.value.message
+    assert endpoint.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_get_public_key_coalesces_concurrent_jwks_refreshes():
+    """Concurrent requests in the TTL-expiry window share one JWKS fetch."""
+    from litellm.caching.dual_cache import DualCache
+
+    _, jwk = _get_rsa_key_and_jwk(kid="coalesced-key")
+    endpoint = _ScriptedJWKSEndpoint(({"keys": [jwk]},), delay=0.05)
+    jwt_handler = _get_jwt_handler_with_scripted_endpoint(DualCache(), endpoint)
+
+    public_keys = await asyncio.gather(
+        *[
+            jwt_handler._get_public_key_from_jwks_url(
+                jwks_url="https://coalesce.example.com/keys",
+                kid="coalesced-key",
+            )
+            for _ in range(5)
+        ]
+    )
+
+    assert public_keys == [jwk] * 5
+    assert endpoint.call_count == 1
 
 
 @pytest.mark.asyncio

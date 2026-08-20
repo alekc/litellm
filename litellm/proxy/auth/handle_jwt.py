@@ -8,12 +8,15 @@ JWT token must have 'litellm_proxy_admin' in scope.
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import hashlib
 import os
 import re
-from typing import Any, Final, Literal, NoReturn, cast
+from collections.abc import Awaitable, Callable
+from typing import Any, Final, Literal, NoReturn, TypeVar, cast
 
+import httpx
 import jwt
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
@@ -72,6 +75,33 @@ from .auth_checks import (
 
 class NoMatchingJWTPublicKeyError(Exception):
     """Raised when a JWKS endpoint returns no key matching the requested ``kid``."""
+
+
+class JWKSUnreachableError(Exception):
+    """Raised when an IdP's JWKS / OIDC discovery endpoint is unreachable and no cached copy is left to fall back on."""
+
+
+JWKS_FETCH_ATTEMPTS: Final = 3
+JWKS_FETCH_RETRY_BACKOFF_SECONDS: Final = 0.25
+JWKS_STALE_CACHE_TTL_SECONDS: Final = 86400
+STALE_CACHE_KEY_PREFIX: Final = "litellm_stale_"
+
+# Per-cache-key locks so a TTL lapse triggers one refresh instead of one per in-flight request.
+_JWKS_REFRESH_LOCKS: Final[dict[str, asyncio.Lock]] = {}  # mutable-ok: lock registry, keyed by JWKS url
+
+_CachedValueT = TypeVar("_CachedValueT")
+
+
+def jwks_unavailable_exception(error: JWKSUnreachableError) -> ProxyException:
+    return ProxyException(
+        message=(
+            "Service Unavailable, the identity provider's JWKS endpoint is temporarily "
+            f"unreachable, so the JWT signature could not be verified. Please retry shortly. Error: {error}"
+        ),
+        type=ProxyErrorTypes.auth_provider_unavailable,
+        param="None",
+        code=status.HTTP_503_SERVICE_UNAVAILABLE,
+    )
 
 
 class JWTHandler:
@@ -611,13 +641,86 @@ class JWTHandler:
         if ".well-known/openid-configuration" not in url:
             return url
 
-        cache_key: Final = f"litellm_oidc_discovery_{url}"
-        cached_jwks_uri: Final = await self.user_api_key_cache.async_get_cache(cache_key)
-        if cached_jwks_uri is not None:
-            return cached_jwks_uri
+        return await self._cached_with_stale_fallback(
+            cache_key=f"litellm_oidc_discovery_{url}",
+            ttl=self._get_public_key_cache_ttl(),
+            refresh=lambda: self._fetch_jwks_uri_from_discovery(url),
+        )
 
+    async def _get_with_transient_retries(self, url: str) -> httpx.Response:
+        """GET ``url``, retrying transport failures so one IdP blip does not fail the request."""
+        for attempt in range(1, JWKS_FETCH_ATTEMPTS):
+            try:
+                return await self.http_handler.get(url)
+            except httpx.TransportError as e:
+                verbose_proxy_logger.warning(
+                    "JWT Auth: %s fetching %s (attempt %s/%s), retrying: %s",
+                    type(e).__name__,
+                    url,
+                    attempt,
+                    JWKS_FETCH_ATTEMPTS,
+                    e,
+                )
+                await asyncio.sleep(JWKS_FETCH_RETRY_BACKOFF_SECONDS * attempt)
+
+        try:
+            return await self.http_handler.get(url)
+        except httpx.TransportError as e:
+            raise JWKSUnreachableError(
+                f"{type(e).__name__} fetching {url} after {JWKS_FETCH_ATTEMPTS} attempts"
+            ) from e
+
+    async def _get_cached_value(self, cache_key: str) -> _CachedValueT | None:
+        cached: Final = await self.user_api_key_cache.async_get_cache(cache_key)
+        return cast("_CachedValueT | None", cached)  # cast-ok: cache reads are untyped
+
+    async def _cached_with_stale_fallback(
+        self,
+        cache_key: str,
+        ttl: float,
+        refresh: Callable[[], Awaitable[_CachedValueT]],
+    ) -> _CachedValueT:
+        """Read ``cache_key``, refreshing it through a single-flight lock on a miss.
+
+        Every refresh also writes a longer-lived copy under a stale key, which is
+        served when the IdP is unreachable. Signing keys rotate rarely, so a
+        last-known-good key beats failing authentication during an IdP blip.
+        """
+        cached: Final[_CachedValueT | None] = await self._get_cached_value(cache_key)
+        if cached is not None:
+            return cached
+
+        lock: Final = _JWKS_REFRESH_LOCKS.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            cached_after_lock: Final[_CachedValueT | None] = await self._get_cached_value(cache_key)
+            if cached_after_lock is not None:
+                return cached_after_lock
+
+            stale_cache_key: Final = f"{STALE_CACHE_KEY_PREFIX}{cache_key}"
+            try:
+                refreshed: Final = await refresh()
+            except JWKSUnreachableError as e:
+                stale: Final[_CachedValueT | None] = await self._get_cached_value(stale_cache_key)
+                if stale is None:
+                    raise
+                verbose_proxy_logger.warning(
+                    "JWT Auth: serving last-known-good cached value for %s, refresh failed: %s",
+                    cache_key,
+                    e,
+                )
+                return stale
+
+            await self.user_api_key_cache.async_set_cache(key=cache_key, value=refreshed, ttl=ttl)
+            await self.user_api_key_cache.async_set_cache(
+                key=stale_cache_key,
+                value=refreshed,
+                ttl=JWKS_STALE_CACHE_TTL_SECONDS,
+            )
+            return refreshed
+
+    async def _fetch_jwks_uri_from_discovery(self, url: str) -> str:
         verbose_proxy_logger.debug("JWT Auth: Fetching OIDC discovery document from %s", url)
-        response: Final = await self.http_handler.get(url)
+        response: Final = await self._get_with_transient_retries(url)
         if response.status_code != 200:
             raise Exception(
                 f"JWT Auth: OIDC discovery endpoint {url} returned status {response.status_code}: {response.text}"
@@ -632,11 +735,6 @@ class JWTHandler:
             raise Exception(f"JWT Auth: OIDC discovery document at {url} does not contain a 'jwks_uri' field.")
 
         verbose_proxy_logger.debug("JWT Auth: Resolved OIDC discovery %s -> jwks_uri=%s", url, jwks_uri)
-        await self.user_api_key_cache.async_set_cache(
-            key=cache_key,
-            value=jwks_uri,
-            ttl=self._get_public_key_cache_ttl(),
-        )
         return jwks_uri
 
     def _get_public_key_cache_ttl(self) -> float:
@@ -645,33 +743,25 @@ class JWTHandler:
             return 600
         return litellm_jwtauth.public_key_ttl
 
+    async def _fetch_jwks_keys(self, resolved_jwks_url: str) -> JWKKeyValue:
+        response: Final = await self._get_with_transient_retries(resolved_jwks_url)
+
+        try:
+            response_json: Final = response.json()
+        except Exception as e:
+            verbose_proxy_logger.error("Error parsing response: %s. Original Response: %s", e, response.text)
+            raise Exception(f"Error parsing response: {e}. Check server logs for original response.")
+
+        keys: Final = response_json["keys"] if "keys" in response_json else response_json
+        return cast(JWKKeyValue, keys)  # cast-ok: JWTKeyItem declares only `kid`, validating would drop key material
+
     async def _get_public_key_from_jwks_url(self, jwks_url: str, kid: str | None) -> dict:
         resolved_jwks_url: Final = await self._resolve_jwks_url(jwks_url)
-        cache_key: Final = f"litellm_jwt_auth_keys_{resolved_jwks_url}"
-
-        cached_keys: Final = await self.user_api_key_cache.async_get_cache(cache_key)
-
-        if cached_keys is None:
-            response: Final = await self.http_handler.get(resolved_jwks_url)
-
-            try:
-                response_json: Final = response.json()
-            except Exception as e:
-                verbose_proxy_logger.error("Error parsing response: %s. Original Response: %s", e, response.text)
-                raise Exception(f"Error parsing response: {e}. Check server logs for original response.")
-
-            if "keys" in response_json:
-                keys: JWKKeyValue = response_json["keys"]
-            else:
-                keys = response_json
-
-            await self.user_api_key_cache.async_set_cache(
-                key=cache_key,
-                value=keys,
-                ttl=self._get_public_key_cache_ttl(),
-            )
-        else:
-            keys = cached_keys
+        keys: Final = await self._cached_with_stale_fallback(
+            cache_key=f"litellm_jwt_auth_keys_{resolved_jwks_url}",
+            ttl=self._get_public_key_cache_ttl(),
+            refresh=lambda: self._fetch_jwks_keys(resolved_jwks_url),
+        )
 
         public_key: Final = self.parse_keys(keys=keys, kid=kid)
         if public_key is not None:
@@ -692,6 +782,9 @@ class JWTHandler:
                 return await self._get_public_key_from_jwks_url(jwks_url=key_url, kid=kid)
             except NoMatchingJWTPublicKeyError as e:
                 verbose_proxy_logger.debug("JWT Auth: No matching public key found at %s: %s", key_url, e)
+            except JWKSUnreachableError as e:
+                verbose_proxy_logger.error("JWT Auth: JWKS endpoint %s unreachable: %s", key_url, e)
+                raise jwks_unavailable_exception(e)
 
         raise NoMatchingJWTPublicKeyError(f"No matching public key found. keys={keys_url_list}, kid={kid}")
 
@@ -969,10 +1062,14 @@ class JWTHandler:
         )
 
     async def _auth_jwt_with_issuer(self, token: str, issuer_config: JWTIssuerConfig, kid: str | None) -> dict:
-        public_key: Final = await self._get_public_key_from_jwks_url(
-            jwks_url=self._get_jwks_url_for_issuer(issuer_config=issuer_config),
-            kid=kid,
-        )
+        try:
+            public_key: Final = await self._get_public_key_from_jwks_url(
+                jwks_url=self._get_jwks_url_for_issuer(issuer_config=issuer_config),
+                kid=kid,
+            )
+        except JWKSUnreachableError as e:
+            raise jwks_unavailable_exception(e)
+
         try:
             payload: Final = self._decode_jwt_with_public_key(
                 token=token,
