@@ -255,6 +255,43 @@ class CheckBatchCost:
             "so it will no longer be polled"
         )
 
+    async def _claim_job_for_costing(self, job: "LiteLLM_ManagedObjectTable") -> bool:
+        """
+        Atomically flip batch_processed from false to true, returning whether this pod won
+        the row. Every pod and uvicorn worker schedules its own poller against the shared
+        table, so without this compare-and-swap two of them can select the same completed
+        batch in one window and both emit an aretrieve_batch spend log for it. Schemas
+        without the column can't be claimed, so they keep the pre-existing behavior.
+        """
+        if not self._has_batch_processed_column:
+            return True
+        try:
+            claimed: Final = await self.prisma_client.db.litellm_managedobjecttable.update_many(
+                where={"id": job.id, "batch_processed": False},
+                data={"batch_processed": True},
+            )
+        except Exception as db_err:
+            verbose_proxy_logger.error(
+                f"CheckBatchCost: failed to claim job {job.id} for cost tracking: {db_err}"
+            )
+            return False
+        return claimed > 0
+
+    async def _release_job_claim(self, job: "LiteLLM_ManagedObjectTable") -> None:
+        """Give a claimed row back once costing it failed, so a later poll cycle retries it."""
+        if not self._has_batch_processed_column:
+            return
+        try:
+            await self.prisma_client.db.litellm_managedobjecttable.update_many(
+                where={"id": job.id, "batch_processed": True},
+                data={"batch_processed": False},
+            )
+        except Exception as db_err:
+            verbose_proxy_logger.error(
+                f"CheckBatchCost: failed to release the claim on job {job.id}, "
+                f"so its cost will not be retried: {db_err}"
+            )
+
     @staticmethod
     def _has_unified_id_without_model(job: "LiteLLM_ManagedObjectTable") -> bool:
         """A unified id that decodes but carries no model_id can never be routed."""
@@ -860,6 +897,12 @@ class CheckBatchCost:
                 response.status in PROVIDER_TERMINAL_BATCH_STATUSES
                 and response.output_file_id is not None
             ):
+                if not await self._claim_job_for_costing(job):
+                    verbose_proxy_logger.info(
+                        f"CheckBatchCost: batch {batch_id} (job {job.id}) was claimed by another "
+                        "pod in this window, so its cost is already being tracked there"
+                    )
+                    continue
                 try:
                     tracked = await self._track_completed_batch_cost(
                         job=job,
@@ -878,6 +921,7 @@ class CheckBatchCost:
                         )
                         await self._finalize_unbilled_terminal_job(job, response)
                         continue
+                    await self._release_job_claim(job)
                     verbose_proxy_logger.error(
                         f"CheckBatchCost: failed to track cost for batch {batch_id} "
                         f"(job {job.id}); leaving it unprocessed so the next poll retries: {tracking_err}"
@@ -885,6 +929,7 @@ class CheckBatchCost:
                     self._record_error(prom_logger, "cost_tracking_error")
                     continue
                 if tracked is None:
+                    await self._release_job_claim(job)
                     continue
 
                 # Track this job for the final metrics summary

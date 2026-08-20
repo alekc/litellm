@@ -6,6 +6,7 @@ Vertex (raw gs:// input_file_id) and Bedrock (raw s3:// input_file_id,
 ARN unified_object_id) batches with no managed unified id.
 """
 
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -95,7 +96,7 @@ class TestCheckBatchCost:
     ):
         """_cleanup_stale_managed_objects scopes its update to file_purpose='batch' only."""
         mock_prisma_client.db.litellm_managedobjecttable.update_many = AsyncMock(
-            return_value=0
+            return_value=1
         )
         # Return empty so the main poll loop exits immediately
         mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(
@@ -161,7 +162,7 @@ class TestCheckBatchCost:
         from litellm.constants import MAX_OBJECTS_PER_POLL_CYCLE
 
         mock_prisma_client.db.litellm_managedobjecttable.update_many = AsyncMock(
-            return_value=0
+            return_value=1
         )
         mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(
             return_value=[]
@@ -192,7 +193,7 @@ class TestCheckBatchCost:
         from litellm.constants import MAX_OBJECTS_PER_POLL_CYCLE
 
         mock_prisma_client.db.litellm_managedobjecttable.update_many = AsyncMock(
-            return_value=0
+            return_value=1
         )
         # First find_many (primary query) raises with a schema error; second (fallback) returns empty
         mock_prisma_client.db.litellm_managedobjecttable.find_many = AsyncMock(
@@ -221,7 +222,7 @@ class TestCheckBatchCost:
         from litellm.constants import MAX_OBJECTS_PER_POLL_CYCLE
 
         mock_prisma_client.db.litellm_managedobjecttable.update_many = AsyncMock(
-            return_value=0
+            return_value=1
         )
         # Simulate column already known absent from a previous cycle
         check_batch_cost_instance._has_batch_processed_column = False
@@ -254,7 +255,7 @@ class TestCheckBatchCost:
         from unittest.mock import patch
 
         mock_prisma_client.db.litellm_managedobjecttable.update_many = AsyncMock(
-            return_value=0
+            return_value=1
         )
         mock_prisma_client.db.litellm_managedobjecttable.update = AsyncMock()
         mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(
@@ -563,7 +564,7 @@ class TestCheckBatchCost:
         from unittest.mock import patch
 
         mock_prisma_client.db.litellm_managedobjecttable.update_many = AsyncMock(
-            return_value=0
+            return_value=1
         )
         mock_prisma_client.db.litellm_managedobjecttable.update = AsyncMock()
         mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(
@@ -679,7 +680,7 @@ class TestCheckBatchCost:
         import litellm
         from litellm.proxy.hooks.proxy_track_cost_callback import _ProxyDBLogger
 
-        mock_prisma_client.db.litellm_managedobjecttable.update_many = AsyncMock(return_value=0)
+        mock_prisma_client.db.litellm_managedobjecttable.update_many = AsyncMock(return_value=1)
         mock_prisma_client.db.litellm_managedobjecttable.update = AsyncMock()
         mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(return_value=None)
 
@@ -801,7 +802,7 @@ class TestCheckBatchCost:
         from unittest.mock import patch
 
         mock_prisma_client.db.litellm_managedobjecttable.update_many = AsyncMock(
-            return_value=0
+            return_value=1
         )
         mock_prisma_client.db.litellm_managedobjecttable.update = AsyncMock()
         mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(
@@ -869,7 +870,7 @@ class TestCheckBatchCost:
         import base64
 
         mock_prisma_client.db.litellm_managedobjecttable.update_many = AsyncMock(
-            return_value=0
+            return_value=1
         )
         mock_prisma_client.db.litellm_managedobjecttable.update = AsyncMock()
         mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(
@@ -944,7 +945,7 @@ class TestCheckBatchCost:
         ).decode()
 
         mock_prisma_client.db.litellm_managedobjecttable.update_many = AsyncMock(
-            return_value=0
+            return_value=1
         )
         mock_prisma_client.db.litellm_managedobjecttable.update = AsyncMock()
         mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(
@@ -1044,7 +1045,7 @@ class TestCheckBatchCost:
         from unittest.mock import patch
 
         mock_prisma_client.db.litellm_managedobjecttable.update_many = AsyncMock(
-            return_value=0
+            return_value=1
         )
         mock_prisma_client.db.litellm_managedobjecttable.update = AsyncMock()
         mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(
@@ -1111,7 +1112,7 @@ class TestCheckBatchCost:
         from unittest.mock import patch
 
         mock_prisma_client.db.litellm_managedobjecttable.update_many = AsyncMock(
-            return_value=0
+            return_value=1
         )
         mock_prisma_client.db.litellm_managedobjecttable.update = AsyncMock()
 
@@ -1168,7 +1169,7 @@ class TestCheckBatchCost:
         from unittest.mock import patch
 
         mock_prisma_client.db.litellm_managedobjecttable.update_many = AsyncMock(
-            return_value=0
+            return_value=1
         )
         mock_prisma_client.db.litellm_managedobjecttable.update = AsyncMock()
         mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(
@@ -1284,7 +1285,7 @@ class TestCheckBatchCost:
         from litellm.exceptions import NotFoundError
 
         mock_prisma_client.db.litellm_managedobjecttable.update_many = AsyncMock(
-            return_value=0
+            return_value=1
         )
         mock_prisma_client.db.litellm_managedobjecttable.update = AsyncMock()
         mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(
@@ -1355,7 +1356,7 @@ class TestCheckBatchCost:
         through the proxy, causing API_KEY errors when clients call GET /files/{id}/content.
         """
         mock_prisma_client.db.litellm_managedobjecttable.update_many = AsyncMock(
-            return_value=0
+            return_value=1
         )
         mock_prisma_client.db.litellm_managedobjecttable.update = AsyncMock()
         mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(
@@ -1672,7 +1673,7 @@ class TestUnmanagedVertexRouting:
         prisma = instance.prisma_client
         prisma.db = MagicMock()
         prisma.db.litellm_managedobjecttable = MagicMock()
-        prisma.db.litellm_managedobjecttable.update_many = AsyncMock(return_value=0)
+        prisma.db.litellm_managedobjecttable.update_many = AsyncMock(return_value=1)
         prisma.db.litellm_managedobjecttable.update = AsyncMock()
         prisma.db.litellm_managedobjecttable.find_many = AsyncMock(
             return_value=[self._job()]
@@ -1902,7 +1903,7 @@ class TestUnmanagedBedrockRouting:
         prisma = instance.prisma_client
         prisma.db = MagicMock()
         prisma.db.litellm_managedobjecttable = MagicMock()
-        prisma.db.litellm_managedobjecttable.update_many = AsyncMock(return_value=0)
+        prisma.db.litellm_managedobjecttable.update_many = AsyncMock(return_value=1)
         prisma.db.litellm_managedobjecttable.update = AsyncMock()
         prisma.db.litellm_managedobjecttable.find_many = AsyncMock(
             return_value=[self._job()]
@@ -2577,3 +2578,181 @@ class TestPollPageStarvation:
         await self._instance(prisma, llm_router).check_batch_cost()
 
         prisma.db.litellm_managedobjecttable.update.assert_not_awaited()
+
+
+class TestMultiPodBatchCostClaim:
+    """LIT-4827 regression: every pod and uvicorn worker schedules its own poller against
+    the shared LiteLLM_ManagedObjectTable, so a completed batch must be claimed atomically
+    before its cost is logged. Without the claim two pods select the same row in one window
+    and both write an aretrieve_batch spend log for it, double counting the spend."""
+
+    @staticmethod
+    def _instance(prisma, llm_router):
+        from litellm_enterprise.proxy.common_utils.check_batch_cost import CheckBatchCost
+
+        proxy_logging_obj = MagicMock()
+        proxy_logging_obj.get_proxy_hook.return_value = None
+        return CheckBatchCost(
+            proxy_logging_obj=proxy_logging_obj,
+            prisma_client=prisma,
+            llm_router=llm_router,
+        )
+
+    @staticmethod
+    def _prisma(claim_result: int):
+        """A prisma double whose row-scoped update_many (the claim) returns claim_result,
+        while the id-less staleness sweeps return 0."""
+
+        async def _update_many(where, data):
+            return claim_result if "id" in where else 0
+
+        job = MagicMock()
+        job.id = "job-claim-1"
+        job.unified_object_id = "dW5pZmllZF9iYXRjaF9pZA=="
+        job.created_by = "user-1"
+
+        prisma = MagicMock()
+        prisma.db.litellm_managedobjecttable.update_many = AsyncMock(side_effect=_update_many)
+        prisma.db.litellm_managedobjecttable.update = AsyncMock()
+        prisma.db.litellm_managedobjecttable.find_many = AsyncMock(return_value=[job])
+        prisma.db.litellm_usertable.find_unique = AsyncMock(return_value=None)
+        return prisma
+
+    @staticmethod
+    def _router():
+        response = MagicMock()
+        response.status = "completed"
+        response.output_file_id = "file-output-123"
+        response.error_file_id = None
+        response.model_dump_json.return_value = '{"id":"batch-1","status":"completed"}'
+
+        deployment = MagicMock()
+        deployment.litellm_params.custom_llm_provider = "openai"
+        deployment.litellm_params.model = "gpt-4"
+        deployment.model_info.model_dump.return_value = {}
+
+        router = MagicMock()
+        router.aretrieve_batch = AsyncMock(return_value=response)
+        router.get_deployment_credentials_with_provider = MagicMock(
+            return_value={"api_key": "sk-test"}
+        )
+        router.get_deployment = MagicMock(return_value=deployment)
+        return router
+
+    @staticmethod
+    @contextmanager
+    def _billing_patches(output_fetch_error=None):
+        """Patch the cost path a claimed batch runs through, yielding the output-file fetch
+        and the synthetic logging object that writes the aretrieve_batch spend log."""
+        file_content = MagicMock()
+        file_content.content = b'{"id":"req-1"}'
+        logging_obj = MagicMock()
+        logging_obj.async_success_handler = AsyncMock()
+
+        with (
+            patch(_IS_B64, side_effect=["llm_model_id,model-123;llm_batch_id,batch-456;", None]),
+            patch(
+                "litellm.proxy.openai_files_endpoints.common_utils.get_model_id_from_unified_batch_id",
+                return_value="model-123",
+            ),
+            patch(
+                "litellm.proxy.openai_files_endpoints.common_utils.get_batch_id_from_unified_batch_id",
+                return_value="batch-456",
+            ),
+            patch(
+                "litellm.files.main.afile_content",
+                new_callable=AsyncMock,
+                return_value=None if output_fetch_error else file_content,
+                side_effect=output_fetch_error,
+            ) as afile_content,
+            patch(
+                "litellm.batches.batch_utils._get_file_content_as_dictionary",
+                return_value=[{"id": "req-1"}],
+            ),
+            patch(
+                "litellm.batches.batch_utils.calculate_batch_cost_and_usage",
+                new_callable=AsyncMock,
+                return_value=(0.01, {"prompt_tokens": 10, "completion_tokens": 5}, ["gpt-4"]),
+            ),
+            patch(
+                "litellm.litellm_core_utils.get_llm_provider_logic.get_llm_provider",
+                return_value=("gpt-4", "openai", None, None),
+            ),
+            patch("litellm.litellm_core_utils.litellm_logging.Logging", return_value=logging_obj),
+        ):
+            yield afile_content, logging_obj
+
+    @staticmethod
+    def _claim_calls(prisma):
+        return [
+            call[1]
+            for call in prisma.db.litellm_managedobjecttable.update_many.call_args_list
+            if "id" in call[1]["where"]
+        ]
+
+    @pytest.mark.asyncio
+    async def test_losing_the_claim_skips_costing(self):
+        """The pod that does not win the row must not fetch results, must not emit a spend
+        log, and must not touch the row the winner owns."""
+        prisma = self._prisma(claim_result=0)
+        router = self._router()
+
+        with self._billing_patches() as (afile_content, logging_obj):
+            await self._instance(prisma, router).check_batch_cost()
+
+        afile_content.assert_not_awaited()
+        logging_obj.async_success_handler.assert_not_awaited()
+        prisma.db.litellm_managedobjecttable.update.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_winning_pod_claims_the_row_then_bills_it(self):
+        """The winner flips batch_processed false -> true before billing, so a concurrent
+        pod's claim finds no matching row."""
+        prisma = self._prisma(claim_result=1)
+        router = self._router()
+
+        with self._billing_patches() as (afile_content, logging_obj):
+            await self._instance(prisma, router).check_batch_cost()
+
+        assert self._claim_calls(prisma) == [
+            {
+                "where": {"id": "job-claim-1", "batch_processed": False},
+                "data": {"batch_processed": True},
+            }
+        ]
+        assert afile_content.await_count == 1
+        logging_obj.async_success_handler.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_failed_costing_releases_the_claim(self):
+        """A transient failure while costing a claimed batch must hand the row back, or its
+        spend is silently lost instead of being retried on the next cycle."""
+        prisma = self._prisma(claim_result=1)
+        router = self._router()
+
+        with self._billing_patches(
+            output_fetch_error=Exception("connection reset")
+        ) as (afile_content, logging_obj):
+            await self._instance(prisma, router).check_batch_cost()
+
+        logging_obj.async_success_handler.assert_not_awaited()
+        assert self._claim_calls(prisma)[-1] == {
+            "where": {"id": "job-claim-1", "batch_processed": True},
+            "data": {"batch_processed": False},
+        }
+
+    @pytest.mark.asyncio
+    async def test_schema_without_batch_processed_still_bills(self):
+        """Older schemas have no column to claim, so they keep the pre-fix behavior instead
+        of losing every batch's cost."""
+        prisma = self._prisma(claim_result=0)
+        router = self._router()
+        instance = self._instance(prisma, router)
+        instance._has_batch_processed_column = False
+
+        with self._billing_patches() as (afile_content, logging_obj):
+            await instance.check_batch_cost()
+
+        assert self._claim_calls(prisma) == []
+        assert afile_content.await_count == 1
+        logging_obj.async_success_handler.assert_awaited_once()
