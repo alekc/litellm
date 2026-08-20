@@ -8,6 +8,7 @@ from fastapi import HTTPException, Request, status
 
 import litellm
 from litellm._logging import verbose_proxy_logger
+from litellm.constants import EMPTY_MAPPING
 from litellm.integrations.otel.runtime import seed_request_identity
 from litellm.proxy._types import (
     LitellmUserRoles,
@@ -31,6 +32,23 @@ if TYPE_CHECKING:
     Span = _Span | Any
 else:
     Span = Any
+
+
+def _with_requester_ip_address(request_data: dict, requester_ip: str | None) -> dict:
+    """Return ``request_data`` with the caller IP stamped into its logging metadata.
+
+    Auth gate rejections (401s, budget 429s) are raised before
+    ``add_litellm_data_to_request`` records the caller IP, so failure logs for them
+    would otherwise carry no IP, and a 401 usually has no key/user identity either.
+    """
+    if not requester_ip:
+        return request_data
+    key: Final = "litellm_metadata" if "litellm_metadata" in request_data else "metadata"
+    metadata: Final = request_data.get(key)
+    base: Final = metadata if isinstance(metadata, dict) else EMPTY_MAPPING
+    if base.get("requester_ip_address"):
+        return request_data
+    return {**request_data, key: {**base, "requester_ip_address": requester_ip}}  # mutable-ok: logging needs dicts
 
 
 class UserAPIKeyAuthExceptionHandler:
@@ -133,7 +151,7 @@ class UserAPIKeyAuthExceptionHandler:
 
             # Allow callbacks to transform the error response
             transformed_exception: Final = await proxy_logging_obj.post_call_failure_hook(
-                request_data=request_data,
+                request_data=_with_requester_ip_address(request_data, requester_ip),
                 original_exception=e,
                 user_api_key_dict=user_api_key_dict,
                 error_type=ProxyErrorTypes.auth_error,
