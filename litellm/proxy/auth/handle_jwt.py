@@ -666,9 +666,7 @@ class JWTHandler:
         try:
             return await self.http_handler.get(url)
         except httpx.TransportError as e:
-            raise JWKSUnreachableError(
-                f"{type(e).__name__} fetching {url} after {JWKS_FETCH_ATTEMPTS} attempts"
-            ) from e
+            raise JWKSUnreachableError(f"{type(e).__name__} fetching {url} after {JWKS_FETCH_ATTEMPTS} attempts") from e
 
     async def _get_cached_value(self, cache_key: str) -> _CachedValueT | None:
         cached: Final = await self.user_api_key_cache.async_get_cache(cache_key)
