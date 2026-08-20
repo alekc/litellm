@@ -1,9 +1,12 @@
 import logging
 import time
-from unittest.mock import AsyncMock, call
+from collections.abc import Mapping
+from typing import Final
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from fastapi import HTTPException
+from pytest_mock import MockerFixture
 
 from litellm.proxy._types import (
     LiteLLM_TeamTable,
@@ -1555,6 +1558,7 @@ async def test_create_group_with_nonexistent_users_rejects(mocker, monkeypatch):
 
     mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(side_effect=mock_user_lookup)
     mock_prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
+    mock_prisma_client.db.litellm_usertable.find_many = AsyncMock(return_value=[])
 
     # Mock dependencies
     mocker.patch(
@@ -1640,6 +1644,7 @@ async def test_update_group_with_nonexistent_users_rejects(mocker, monkeypatch):
 
     mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(side_effect=mock_user_lookup)
     mock_prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
+    mock_prisma_client.db.litellm_usertable.find_many = AsyncMock(return_value=[])
 
     # Mock dependencies
     mocker.patch(
@@ -1710,6 +1715,7 @@ async def test_create_group_with_nonexistent_users_creates_when_flag_true(mocker
 
     mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(side_effect=mock_user_lookup)
     mock_prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
+    mock_prisma_client.db.litellm_usertable.find_many = AsyncMock(return_value=[])
 
     # Mock user creation
     created_user_1 = NewUserResponse(user_id="new-user-1", key="test-key-1")
@@ -1799,6 +1805,7 @@ async def test_extract_group_member_ids_with_flag_true_creates_users(mocker, mon
 
     mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(side_effect=mock_user_lookup)
     mock_prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
+    mock_prisma_client.db.litellm_usertable.find_many = AsyncMock(return_value=[])
 
     # Mock user creation
     created_user = NewUserResponse(user_id="new-user-1", key="test-key-1")
@@ -1868,6 +1875,7 @@ async def test_extract_group_member_ids_with_flag_false_rejects(mocker, monkeypa
 
     mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(side_effect=mock_user_lookup)
     mock_prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
+    mock_prisma_client.db.litellm_usertable.find_many = AsyncMock(return_value=[])
 
     # Mock dependencies
     mocker.patch(
@@ -1918,6 +1926,7 @@ async def test_process_group_patch_operations_with_flag_true_creates_users(mocke
     # Mock user lookup - new-user-1 doesn't exist
     mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(return_value=None)
     mock_prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
+    mock_prisma_client.db.litellm_usertable.find_many = AsyncMock(return_value=[])
     mock_prisma_client.db.litellm_teamtable.find_unique = AsyncMock(return_value=None)
 
     # Mock user creation
@@ -1974,6 +1983,7 @@ async def test_process_group_patch_operations_with_flag_false_rejects(mocker, mo
     # Mock user lookup - new-user-1 doesn't exist
     mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(return_value=None)
     mock_prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
+    mock_prisma_client.db.litellm_usertable.find_many = AsyncMock(return_value=[])
     mock_prisma_client.db.litellm_teamtable.find_unique = AsyncMock(return_value=None)
 
     # Execute the function - should raise HTTPException
@@ -3541,14 +3551,15 @@ async def test_process_group_patch_replace_empty_value_does_not_use_path_filter(
 
 
 def _member_resolution_prisma(
-    mocker,
+    mocker: MockerFixture,
     *,
-    users: set,
-    teams: set,
-    unmanaged_teams: frozenset = frozenset(),
-    email_to_user_id: dict[str, str] | None = None,
-    sso_user_id_to_user_id: dict[str, str] | None = None,
-):
+    users: set[str],
+    teams: set[str],
+    unmanaged_teams: frozenset[str] = frozenset(),
+    email_to_user_id: Mapping[str, str] | None = None,
+    email_to_user_ids: Mapping[str, tuple[str, ...]] | None = None,
+    sso_user_id_to_user_id: Mapping[str, str] | None = None,
+) -> MagicMock:
     """Prisma mock where only the given ids resolve to a user row / team row.
 
     ``teams`` are teams a SCIM group write created, so they carry provenance;
@@ -3562,31 +3573,48 @@ def _member_resolution_prisma(
             return LiteLLM_TeamTable(team_id=team_id, metadata={})
         return None
 
+    def user_row(where: Mapping[str, str]) -> LiteLLM_UserTable | None:
+        user_id: Final = where["user_id"]
+        if user_id in users:
+            return LiteLLM_UserTable(user_id=user_id)
+        return None
+
     prisma_client = mocker.MagicMock()
     prisma_client.db = mocker.MagicMock()
     prisma_client.db.litellm_usertable = mocker.MagicMock()
-    prisma_client.db.litellm_usertable.find_unique = AsyncMock(
-        side_effect=lambda where: (
-            LiteLLM_UserTable(user_id=where["user_id"]) if where["user_id"] in users else None
-        )
-    )
+    prisma_client.db.litellm_usertable.find_unique = AsyncMock(side_effect=user_row)
 
-    def fallback_user_row(where):
+    def sso_user_row(where: Mapping[str, str]) -> LiteLLM_UserTable | None:
         if (
             "sso_user_id" in where
             and sso_user_id_to_user_id is not None
             and where["sso_user_id"] in sso_user_id_to_user_id
         ):
-            sso_user_id = where["sso_user_id"]
+            sso_user_id: Final = where["sso_user_id"]
             return LiteLLM_UserTable(user_id=sso_user_id_to_user_id[sso_user_id], sso_user_id=sso_user_id)
-        if "user_email" in where and email_to_user_id is not None and where["user_email"] in email_to_user_id:
-            user_email = where["user_email"]
-            return LiteLLM_UserTable(user_id=email_to_user_id[user_email], user_email=user_email)
         return None
 
-    prisma_client.db.litellm_usertable.find_first = AsyncMock(side_effect=fallback_user_row)
+    def email_user_rows(where: Mapping[str, str], take: int) -> tuple[LiteLLM_UserTable, ...]:
+        user_email: Final = where["user_email"]
+        user_ids: Final = (
+            email_to_user_ids[user_email]
+            if email_to_user_ids is not None and user_email in email_to_user_ids
+            else (
+                (email_to_user_id[user_email],)
+                if email_to_user_id is not None and user_email in email_to_user_id
+                else ()
+            )
+        )
+        return tuple(LiteLLM_UserTable(user_id=user_id, user_email=user_email) for user_id in user_ids[:take])
+
+    def team_lookup(where: Mapping[str, str]) -> LiteLLM_TeamTable | None:
+        team_id: Final = where["team_id"]
+        return team_row(team_id)
+
+    prisma_client.db.litellm_usertable.find_first = AsyncMock(side_effect=sso_user_row)
+    prisma_client.db.litellm_usertable.find_many = AsyncMock(side_effect=email_user_rows)
     prisma_client.db.litellm_teamtable = mocker.MagicMock()
-    prisma_client.db.litellm_teamtable.find_unique = AsyncMock(side_effect=lambda where: team_row(where["team_id"]))
+    prisma_client.db.litellm_teamtable.find_unique = AsyncMock(side_effect=team_lookup)
     return prisma_client
 
 
@@ -4415,8 +4443,48 @@ async def test_resolve_group_member_ids_matches_user_email(mocker, scim_upsert_u
     assert result.all_member_ids == ["email-user"]
     assert prisma_client.db.litellm_usertable.find_first.await_args_list == [
         call(where={"sso_user_id": "member@example.com"}),
-        call(where={"user_email": "member@example.com"}),
     ]
+    assert prisma_client.db.litellm_usertable.find_many.await_args_list == [
+        call(where={"user_email": "member@example.com"}, take=2)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_group_member_ids_does_not_resolve_ambiguous_user_email(
+    mocker, scim_upsert_user_enabled, caplog
+):
+    """Duplicate email rows must remain unknown instead of selecting an arbitrary user."""
+    prisma_client = _member_resolution_prisma(
+        mocker,
+        users=set(),
+        teams=set(),
+        email_to_user_ids={"duplicate@example.com": ("email-user-a", "email-user-b")},
+    )
+    create_user_mock = mocker.patch(
+        "litellm.proxy.management_endpoints.scim.scim_v2._create_user_if_not_exists",
+        AsyncMock(return_value=NewUserResponse(user_id="placeholder", key="placeholder-key")),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"):
+        result = await _resolve_group_member_ids(
+            members=[SCIMMember(value="duplicate@example.com")],
+            created_via="scim_group_membership",
+            prisma_client=prisma_client,
+        )
+
+    create_user_mock.assert_awaited_once_with(user_id="duplicate@example.com", created_via="scim_group_membership")
+    assert result.existing_member_ids == []
+    assert result.created_users == [NewUserResponse(user_id="placeholder", key="placeholder-key")]
+    assert result.all_member_ids == ["duplicate@example.com"]
+    assert prisma_client.db.litellm_usertable.find_many.await_args_list == [
+        call(where={"user_email": "duplicate@example.com"}, take=2)
+    ]
+    assert any(
+        record.levelno >= logging.WARNING
+        and "duplicate@example.com" in record.getMessage()
+        and "multiple accounts by email" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio

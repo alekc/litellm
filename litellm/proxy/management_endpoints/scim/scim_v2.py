@@ -571,18 +571,34 @@ async def _classify_group_member(member: SCIMMember, prisma_client: PrismaClient
         if team is not None and _team_metadata_has_scim_provenance(team.metadata):
             return _SkippedGroupMember(value=value, reason="existing_team")
 
-    for attribute in ("sso_user_id", "user_email"):
-        fallback_user = await _table(UserRepository(prisma_client)).find_first(
-            where={attribute: value},  # mutable-ok: Prisma serializer requires a concrete dict
+    sso_user: Final = await _table(UserRepository(prisma_client)).find_first(
+        where={"sso_user_id": value},  # mutable-ok: Prisma serializer requires a concrete dict
+    )
+    if sso_user is not None:
+        verbose_proxy_logger.info(
+            "SCIM: group member '%s' matched user_id '%s' by sso_user_id",
+            value,
+            sso_user.user_id,
         )
-        if fallback_user is not None:
-            verbose_proxy_logger.info(
-                "SCIM: group member '%s' matched user_id '%s' by %s",
-                value,
-                fallback_user.user_id,
-                attribute,
-            )
-            return _ResolvedUserMember(user_id=fallback_user.user_id)
+        return _ResolvedUserMember(user_id=sso_user.user_id)
+
+    email_users: Final = await _table(UserRepository(prisma_client)).find_many(
+        where={"user_email": value},  # mutable-ok: Prisma serializer requires a concrete dict
+        take=2,
+    )
+    if len(email_users) == 1:
+        email_user: Final = email_users[0]
+        verbose_proxy_logger.info(
+            "SCIM: group member '%s' matched user_id '%s' by user_email",
+            value,
+            email_user.user_id,
+        )
+        return _ResolvedUserMember(user_id=email_user.user_id)
+    if len(email_users) > 1:
+        verbose_proxy_logger.warning(
+            "SCIM: group member '%s' matched multiple accounts by email and cannot be resolved unambiguously",
+            value,
+        )
 
     return _UnknownMember(value=value)
 
